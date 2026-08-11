@@ -44,7 +44,6 @@ class LifecycleMessageHandler:
                 max_retries=settings.max_retries,
             )
 
-            lifecycle.state = decision.next_state
             session.commit()
 
         logger.info(

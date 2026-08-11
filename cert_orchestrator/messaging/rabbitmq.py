@@ -3,6 +3,7 @@ from typing import Awaitable, Callable
 
 import aio_pika
 from aio_pika.abc import AbstractIncomingMessage
+from pydantic import ValidationError
 
 from cert_orchestrator.config import settings
 from cert_orchestrator.schemas import CompletionEvent
@@ -31,9 +32,14 @@ class RabbitMQClient:
         queue = await self.channel.declare_queue(settings.incoming_queue, durable=True)
 
         async def _on_message(message: AbstractIncomingMessage) -> None:
-            async with message.process(requeue=False):
+            try:
                 payload = json.loads(message.body.decode("utf-8"))
                 await handler(payload)
+                await message.ack()
+            except (json.JSONDecodeError, ValidationError):
+                await message.reject(requeue=False)
+            except Exception:
+                await message.nack(requeue=True)
 
         await queue.consume(_on_message)
 

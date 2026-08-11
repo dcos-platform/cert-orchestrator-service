@@ -18,6 +18,8 @@ alembic upgrade head
 uvicorn cert_orchestrator.main:app --reload
 ```
 
+> Retry message delay uses RabbitMQ's `x-delay` header and requires the delayed message exchange plugin to be available in the target broker setup.
+
 ## Test
 
 ```bash

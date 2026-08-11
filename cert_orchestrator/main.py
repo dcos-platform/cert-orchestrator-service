@@ -1,4 +1,3 @@
-import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -19,13 +18,9 @@ async def lifespan(app: FastAPI):
 
     handler = LifecycleMessageHandler(rabbitmq)
     await rabbitmq.consume(handler.handle)
-
-    consumer_task = asyncio.create_task(asyncio.Event().wait())
-    app.state.consumer_task = consumer_task
     try:
         yield
     finally:
-        consumer_task.cancel()
         await rabbitmq.close()
 
 

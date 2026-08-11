@@ -30,3 +30,4 @@ include = ["cert_orchestrator*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "strict"
