@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cert-orchestrator-service"
+version = "0.1.0"
+description = "FastAPI certificate lifecycle orchestrator service"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111.0",
+  "uvicorn>=0.30.0",
+  "sqlalchemy>=2.0.31",
+  "psycopg[binary]>=3.2.0",
+  "alembic>=1.13.2",
+  "pydantic>=2.8.2",
+  "pydantic-settings>=2.3.4",
+  "aio-pika>=9.4.2"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.2.2",
+  "pytest-asyncio>=0.23.8",
+]
+
+[tool.setuptools.packages.find]
+include = ["cert_orchestrator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
