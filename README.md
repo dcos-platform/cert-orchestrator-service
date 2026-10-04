@@ -12,8 +12,30 @@ FastAPI based orchestrator that consumes certificate lifecycle events, runs a st
 
 ## Run locally
 
+Install dependencies:
+
 ```bash
 pip install -e .[test]
+```
+
+Set environment variables (see `context.md` for defaults and the full table):
+
+```bash
+export CERT_ORCH_POSTGRES_HOST=localhost
+export CERT_ORCH_POSTGRES_PORT=5432
+export CERT_ORCH_POSTGRES_DB=cert_orchestrator
+export CERT_ORCH_POSTGRES_USER=dcos
+export CERT_ORCH_POSTGRES_PASSWORD=changeme
+export CERT_ORCH_RABBITMQ_HOST=localhost
+export CERT_ORCH_RABBITMQ_PORT=5672
+export CERT_ORCH_RABBITMQ_USER=dcos
+export CERT_ORCH_RABBITMQ_PASSWORD=changeme
+export CERT_ORCH_RABBITMQ_VHOST=/
+```
+
+Apply migrations and start the service:
+
+```bash
 alembic upgrade head
 uvicorn cert_orchestrator.main:app --reload
 ```

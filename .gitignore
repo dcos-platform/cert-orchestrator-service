@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Captured test and build output
+*_output.txt
+*.stackdump

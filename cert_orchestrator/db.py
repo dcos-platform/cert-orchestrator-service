@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from cert_orchestrator.config import settings
 
-engine = create_engine(settings.database_url, future=True)
+engine = create_engine(settings.resolved_database_url, future=True)
 SessionLocal = sessionmaker(bind=engine, class_=Session, autoflush=False, expire_on_commit=False)
 
 
