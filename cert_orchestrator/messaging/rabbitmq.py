@@ -11,7 +11,7 @@ from cert_orchestrator.schemas import CompletionEvent
 
 class RabbitMQClient:
     def __init__(self, url: str | None = None):
-        self.url = url or settings.rabbitmq_url
+        self.url = url or settings.resolved_rabbitmq_url
         self.connection: aio_pika.RobustConnection | None = None
         self.channel: aio_pika.abc.AbstractRobustChannel | None = None
 

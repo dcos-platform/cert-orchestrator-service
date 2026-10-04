@@ -17,7 +17,6 @@ depends_on = None
 
 def upgrade() -> None:
     lifecycle_state = sa.Enum("PENDING", "PROCESSING", "COMPLETED", "FAILED", name="lifecyclestate")
-    lifecycle_state.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "certificate_lifecycles",
