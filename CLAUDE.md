@@ -13,7 +13,7 @@ Changes that require an update to `context.md`:
 
 ## Code Quality
 
-**Cognitive complexity:** ≤ 15 per function (measured by tools like radon).
+**Cognitive complexity:** ≤ 15 per function (enforced by SonarCloud rule `python:S3776`).
 
 **Fanout:** ≤ 5 as a guideline (a function calls at most 5 other functions directly).
 
@@ -23,7 +23,9 @@ Changes that require an update to `context.md`:
 
 **Business logic:** All business logic must be unit-tested.
 
-**Test coverage:** ≥ 95% branch coverage on new code (`pytest --cov` with `branch = true` in `pyproject.toml`).
+**Test coverage:** ≥ 95% branch coverage on new code (`pytest --cov` with `branch = true` in `pyproject.toml`). Enforced in CI by `diff-cover` at 95% of changed lines on every pull request, and by `fail_under` in `pyproject.toml` on the whole codebase. `fail_under` only ever rises: each story sets it to its measured total, rounded down, until 95.
+
+**Lint:** ruff, configuration in `pyproject.toml`; `ruff check .` and `ruff format --check .` must pass. `# noqa` needs the rule code and a reason on the same line.
 
 **Type hints:** All public functions and class methods have type hints on parameters and return values.
 
@@ -49,7 +51,7 @@ Every path or line excluded from coverage must be listed here with its reason. A
 
 ## Repository Rules
 
-- **Git operations:** Never commit, push, tag, merge, or rebase. The owner performs all git operations. The committable surface is exactly: `alembic/`, `alembic.ini`, `cert_orchestrator/`, `tests/`, `pyproject.toml`, `.gitignore`, `README.md`, `CLAUDE.md`, `context.md`.
+- **Git operations:** Never commit, push, tag, merge, or rebase. The owner performs all git operations. The committable surface is exactly: `alembic/`, `alembic.ini`, `cert_orchestrator/`, `tests/`, `pyproject.toml`, `.gitignore`, `LICENSE`, `.github/`, `sonar-project.properties`, `README.md`, `CLAUDE.md`, `context.md`.
 
 ## Documentation
 

@@ -1,8 +1,8 @@
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import create_engine, pool
 
+from alembic import context
 from cert_orchestrator.config import settings
 from cert_orchestrator.models import Base
 

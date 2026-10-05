@@ -1,5 +1,5 @@
 import json
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 import aio_pika
 from aio_pika.abc import AbstractIncomingMessage

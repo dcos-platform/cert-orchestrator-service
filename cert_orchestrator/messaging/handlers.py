@@ -48,13 +48,18 @@ class LifecycleMessageHandler:
 
         logger.info(
             "Processed lifecycle event",
-            extra={"event_id": event.event_id, "certificate_id": event.certificate_id, "state": decision.next_state.value},
+            extra={
+                "event_id": event.event_id,
+                "certificate_id": event.certificate_id,
+                "state": decision.next_state.value,
+            },
         )
 
         if decision.should_retry:
             retry_payload = event.model_dump(mode="json")
             retry_payload["event_id"] = f"{event.event_id}:retry:{lifecycle.retry_count}"
-            await self.publisher.publish_retry(retry_payload, delay_seconds=settings.backoff_seconds * lifecycle.retry_count)
+            delay = settings.backoff_seconds * lifecycle.retry_count
+            await self.publisher.publish_retry(retry_payload, delay_seconds=delay)
             return
 
         if decision.should_publish_completion:
