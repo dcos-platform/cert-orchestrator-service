@@ -45,5 +45,21 @@ uvicorn cert_orchestrator.main:app --reload
 ## Test
 
 ```bash
+ruff check .
+ruff format --check .
 pytest tests -q
 ```
+
+## CI
+
+[![CI](https://github.com/dcos-platform/cert-orchestrator-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dcos-platform/cert-orchestrator-service/actions/workflows/ci.yml)
+[![SonarCloud Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=dcos-platform_cert-orchestrator-service&metric=alert_status)](https://sonarcloud.io/dashboard?id=dcos-platform_cert-orchestrator-service)
+
+Every pull request and push to `main` runs:
+
+- Lint check (`ruff`)
+- Format check (`ruff`)
+- Test suite with branch coverage (floor: 78%)
+- New-code coverage gate (95% of changed lines, PRs only)
+- Migration round trip (upgrade, downgrade, upgrade)
+- SonarCloud analysis with quality gate wait

@@ -9,7 +9,7 @@ A FastAPI service that consumes certificate lifecycle events from RabbitMQ, proc
 - **Routing key ignored:** The routing key is currently discarded (`rabbitmq.py`), so all four operations are handled identically — until Stories 3 and 4.
 - **Retry backoff inert:** Retry backoff (`x-delay` on the default exchange) does not work — until Story 3.
 - **No DLQ:** Invalid events are discarded without a dead-letter queue; unexpected exceptions requeue forever — until Story 3.
-- **No CI:** No CI and no quality gate yet — until Story 2. Until then, coverage and tests are only as good as the last local run.
+- **Coverage metrics:** The new-code coverage gate uses **line** coverage (via `diff-cover`), while the codebase floor uses **branch** coverage.
 
 ## Architecture
 
@@ -46,6 +46,19 @@ All configuration is environment-driven via `Settings` in `cert_orchestrator/con
 | `CERT_ORCH_RABBITMQ_PASSWORD` | `SecretStr` | `changeme` |
 | `CERT_ORCH_RABBITMQ_VHOST` | `str` | `/` |
 
+## Quality Gates
+
+CI runs on every pull request to `main` and every push to `main`:
+
+1. **Lint:** `ruff check .`
+2. **Format:** `ruff format --check .`
+3. **Tests with coverage:** `pytest --cov=cert_orchestrator --cov-report=xml --cov-report=term` (branch coverage floor: 78%)
+4. **New-code coverage (PRs only):** `diff-cover` at 95% of changed lines
+5. **Migration round trip:** `alembic upgrade head`, `alembic downgrade base`, `alembic upgrade head`
+6. **SonarCloud analysis:** Quality gate wait on PRs and `main` push. The org is on SonarCloud's Free plan, which allows only the built-in *Sonar way* gate (80% coverage on new code). The platform's 95% bar is enforced by step 4 (`diff-cover`), not by SonarCloud.
+
+Branch protection is not currently applied (applied after Story 2 merges).
+
 ## How to Run
 
 Install dependencies, apply migrations, start the service:
@@ -76,7 +89,7 @@ pytest tests --cov=cert_orchestrator --cov-report=term-missing
 | Story | Status | Notes |
 |---|---|---|
 | Story 1 | Complete | Run from clean, establish repo conventions. Approved 2026-10-04. Coverage baseline: 70% total (branch), `config.py` 100%. |
-| Story 2 | Pending | CI workflow, SonarCloud, quality gate, coverage floor. |
+| Story 2 | Complete | CI workflow, SonarCloud, quality gate. Coverage floor: 78% (branch coverage; 78.52% measured). |
 | Story 3 | Pending | DLQ, redelivery, routing key, headers, retry backoff. |
 | Story 4 | Pending | Operation awareness, `PROCESSING` state, `retry_count` semantics. |
 | Story 5 | Pending | `message_id` / `x-correlation-id` on completions. |

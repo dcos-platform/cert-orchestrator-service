@@ -4,8 +4,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from cert_orchestrator.models import Base
 from cert_orchestrator.messaging.handlers import LifecycleMessageHandler
+from cert_orchestrator.models import Base
 
 
 class StubPublisher:

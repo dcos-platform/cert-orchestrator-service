@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from cert_orchestrator.config import Settings
+from cert_orchestrator.messaging import rabbitmq as rabbitmq_module
 from cert_orchestrator.messaging.rabbitmq import RabbitMQClient
 
 
@@ -22,8 +23,14 @@ class TestDatabaseUrlDefaults:
 
     def test_defaults_produce_correct_url(self, clean_env):
         """Defaults produce postgresql+psycopg://dcos:changeme@localhost:5432/cert_orchestrator."""
-        for key in ("CERT_ORCH_POSTGRES_HOST", "CERT_ORCH_POSTGRES_PORT", "CERT_ORCH_POSTGRES_DB",
-                    "CERT_ORCH_POSTGRES_USER", "CERT_ORCH_POSTGRES_PASSWORD", "CERT_ORCH_DATABASE_URL"):
+        for key in (
+            "CERT_ORCH_POSTGRES_HOST",
+            "CERT_ORCH_POSTGRES_PORT",
+            "CERT_ORCH_POSTGRES_DB",
+            "CERT_ORCH_POSTGRES_USER",
+            "CERT_ORCH_POSTGRES_PASSWORD",
+            "CERT_ORCH_DATABASE_URL",
+        ):
             clean_env.delenv(key, raising=False)
 
         settings = Settings()
@@ -93,8 +100,14 @@ class TestRabbitmqUrlDefaults:
 
     def test_defaults_produce_correct_url(self, clean_env):
         """Defaults produce amqp://dcos:changeme@localhost:5672/%2F."""
-        for key in ("CERT_ORCH_RABBITMQ_HOST", "CERT_ORCH_RABBITMQ_PORT", "CERT_ORCH_RABBITMQ_USER",
-                    "CERT_ORCH_RABBITMQ_PASSWORD", "CERT_ORCH_RABBITMQ_VHOST", "CERT_ORCH_RABBITMQ_URL"):
+        for key in (
+            "CERT_ORCH_RABBITMQ_HOST",
+            "CERT_ORCH_RABBITMQ_PORT",
+            "CERT_ORCH_RABBITMQ_USER",
+            "CERT_ORCH_RABBITMQ_PASSWORD",
+            "CERT_ORCH_RABBITMQ_VHOST",
+            "CERT_ORCH_RABBITMQ_URL",
+        ):
             clean_env.delenv(key, raising=False)
 
         settings = Settings()
@@ -132,18 +145,33 @@ class TestRabbitmqUrlDefaults:
 
     def test_rabbitmq_vhost_override_default_slash(self, clean_env):
         """Default vhost / renders as %2F."""
-        for key in ("CERT_ORCH_RABBITMQ_HOST", "CERT_ORCH_RABBITMQ_PORT", "CERT_ORCH_RABBITMQ_USER",
-                    "CERT_ORCH_RABBITMQ_PASSWORD", "CERT_ORCH_RABBITMQ_VHOST", "CERT_ORCH_RABBITMQ_URL"):
+        for key in (
+            "CERT_ORCH_RABBITMQ_HOST",
+            "CERT_ORCH_RABBITMQ_PORT",
+            "CERT_ORCH_RABBITMQ_USER",
+            "CERT_ORCH_RABBITMQ_PASSWORD",
+            "CERT_ORCH_RABBITMQ_VHOST",
+            "CERT_ORCH_RABBITMQ_URL",
+        ):
             clean_env.delenv(key, raising=False)
 
         settings = Settings()
-        assert "/%2F" in settings.resolved_rabbitmq_url
+        assert settings.resolved_rabbitmq_url == "amqp://dcos:changeme@localhost:5672/%2F"
 
     def test_rabbitmq_vhost_override_custom(self, clean_env):
         """Custom vhost renders correctly."""
+        for key in (
+            "CERT_ORCH_RABBITMQ_HOST",
+            "CERT_ORCH_RABBITMQ_PORT",
+            "CERT_ORCH_RABBITMQ_USER",
+            "CERT_ORCH_RABBITMQ_PASSWORD",
+            "CERT_ORCH_RABBITMQ_VHOST",
+            "CERT_ORCH_RABBITMQ_URL",
+        ):
+            clean_env.delenv(key, raising=False)
         clean_env.setenv("CERT_ORCH_RABBITMQ_VHOST", "dcos")
         settings = Settings()
-        assert "/dcos" in settings.resolved_rabbitmq_url
+        assert settings.resolved_rabbitmq_url == "amqp://dcos:changeme@localhost:5672/dcos"
 
     def test_rabbitmq_url_override_wins(self, clean_env):
         """CERT_ORCH_RABBITMQ_URL wins over components."""
@@ -193,15 +221,14 @@ class TestSecretHandling:
 class TestRabbitMQClient:
     """Test RabbitMQClient integration."""
 
-    def test_rabbitmq_client_uses_resolved_url(self, clean_env):
+    def test_rabbitmq_client_uses_resolved_url(self, clean_env, monkeypatch):
         """RabbitMQClient() with no argument uses settings.resolved_rabbitmq_url."""
         clean_env.setenv("CERT_ORCH_RABBITMQ_HOST", "myhost")
         clean_env.setenv("CERT_ORCH_RABBITMQ_PORT", "5673")
         test_settings = Settings()
-        client = RabbitMQClient(url=test_settings.resolved_rabbitmq_url)
+        monkeypatch.setattr(rabbitmq_module, "settings", test_settings)
+        client = RabbitMQClient()
         assert client.url == test_settings.resolved_rabbitmq_url
-        assert "myhost" in client.url
-        assert "5673" in client.url
 
     def test_rabbitmq_client_uses_explicit_url(self, clean_env):
         """RabbitMQClient(url="...") uses the provided URL."""
