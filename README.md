@@ -40,14 +40,23 @@ alembic upgrade head
 uvicorn cert_orchestrator.main:app --reload
 ```
 
-> Retry message delay uses RabbitMQ's `x-delay` header and requires the delayed message exchange plugin to be available in the target broker setup.
+Retry message delays are implemented using broker-native wait queues with TTL and dead-lettering to avoid message loss. A dead-letter queue (`cert.orchestrator.dlq`) collects messages that cannot be decoded, validated, or retried.
 
 ## Test
 
+Run tests with broker (via Docker on `dcos-net`):
+
 ```bash
+docker run --rm --network dcos-net --name rabbitmq -p 5672:5672 -e RABBITMQ_DEFAULT_USER=dcos -e RABBITMQ_DEFAULT_PASS=changeme rabbitmq:3.12-alpine
+CERT_ORCH_RABBITMQ_HOST=rabbitmq pytest --cov=cert_orchestrator --cov-report=term
+```
+
+Run unit tests only (no broker needed):
+
+```bash
+pytest tests -q -m "not integration"
 ruff check .
 ruff format --check .
-pytest tests -q
 ```
 
 ## CI
@@ -59,7 +68,7 @@ Every pull request and push to `main` runs:
 
 - Lint check (`ruff`)
 - Format check (`ruff`)
-- Test suite with branch coverage (floor: 78%)
+- Test suite with branch coverage (floor: 93%)
 - New-code coverage gate (95% of changed lines, PRs only)
 - Migration round trip (upgrade, downgrade, upgrade)
 - SonarCloud analysis with quality gate wait

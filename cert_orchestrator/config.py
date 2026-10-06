@@ -24,7 +24,11 @@ class Settings(BaseSettings):
     rabbitmq_vhost: str = "/"
     incoming_queue: str = "certificate.lifecycle.events"
     completion_queue: str = "certificate.lifecycle.completions"
+    dead_letter_exchange: str = "cert.orchestrator.dlx"
+    dead_letter_queue: str = "cert.orchestrator.dlq"
+    wait_queue_prefix: str = "cert.orchestrator.wait"
     max_retries: int = 3
+    max_delivery_attempts: int = 3
     backoff_seconds: int = 5
 
     model_config = SettingsConfigDict(env_prefix="CERT_ORCH_", extra="ignore")

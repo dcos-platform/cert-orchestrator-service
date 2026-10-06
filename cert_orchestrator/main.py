@@ -12,7 +12,7 @@ configure_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    rabbitmq = RabbitMQClient(settings.resolved_rabbitmq_url)
+    rabbitmq = RabbitMQClient()
     await rabbitmq.connect()
     app.state.rabbitmq = rabbitmq
 
