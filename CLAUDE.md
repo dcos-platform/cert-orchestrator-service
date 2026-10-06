@@ -36,6 +36,7 @@ Changes that require an update to `context.md`:
 Every path or line excluded from coverage must be listed here with its reason. An exclusion not listed here is a defect.
 
 - `alembic/` — migration scripts run against a real database, not in unit tests. Each migration is proven by an `upgrade` / `downgrade` / `upgrade` round trip against an empty database. `# pragma: no cover` is not used.
+- Lines consisting only of `...` — `Protocol` method bodies, never executed by design (`exclude_also` in `pyproject.toml`).
 
 ## String Literals
 

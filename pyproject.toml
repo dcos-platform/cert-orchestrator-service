@@ -34,6 +34,7 @@ include = ["cert_orchestrator*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
+markers = ["integration: needs a running RabbitMQ"]
 
 [tool.coverage.run]
 branch = true
@@ -41,9 +42,10 @@ source = ["cert_orchestrator"]
 relative_files = true
 
 [tool.coverage.report]
-fail_under = 78
+fail_under = 93
 precision = 2
 show_missing = true
+exclude_also = ["^\\s*\\.\\.\\.$"]
 
 [tool.ruff]
 line-length = 120

@@ -3,6 +3,7 @@ import logging
 from cert_orchestrator.config import settings
 from cert_orchestrator.db import get_session
 from cert_orchestrator.messaging.events import EventPublisher
+from cert_orchestrator.messaging.inbound import InboundMessage
 from cert_orchestrator.persistence.repository import LifecycleRepository
 from cert_orchestrator.schemas import CertificateLifecycleEvent, CompletionEvent
 from cert_orchestrator.state_machine import decide_transition
@@ -14,8 +15,8 @@ class LifecycleMessageHandler:
     def __init__(self, publisher: EventPublisher):
         self.publisher = publisher
 
-    async def handle(self, payload: dict) -> None:
-        event = CertificateLifecycleEvent.model_validate(payload)
+    async def handle(self, message: InboundMessage) -> None:
+        event = CertificateLifecycleEvent.model_validate(message.body)
 
         with get_session() as session:
             repository = LifecycleRepository(session)
@@ -44,6 +45,24 @@ class LifecycleMessageHandler:
                 max_retries=settings.max_retries,
             )
 
+            if decision.should_retry:
+                retry_payload = event.model_dump(mode="json")
+                retry_payload["event_id"] = f"{event.event_id}:retry:{lifecycle.retry_count}"
+                delay = settings.backoff_seconds * lifecycle.retry_count
+                await self.publisher.publish_retry(
+                    retry_payload, delay_seconds=delay, routing_key=message.routing_key, headers=message.headers
+                )
+            elif decision.should_publish_completion:
+                await self.publisher.publish_completion(
+                    CompletionEvent(
+                        event_id=event.event_id,
+                        certificate_id=event.certificate_id,
+                        status=decision.next_state.value,
+                        retry_count=lifecycle.retry_count,
+                        error=lifecycle.last_error,
+                    )
+                )
+
             session.commit()
 
         logger.info(
@@ -54,21 +73,3 @@ class LifecycleMessageHandler:
                 "state": decision.next_state.value,
             },
         )
-
-        if decision.should_retry:
-            retry_payload = event.model_dump(mode="json")
-            retry_payload["event_id"] = f"{event.event_id}:retry:{lifecycle.retry_count}"
-            delay = settings.backoff_seconds * lifecycle.retry_count
-            await self.publisher.publish_retry(retry_payload, delay_seconds=delay)
-            return
-
-        if decision.should_publish_completion:
-            await self.publisher.publish_completion(
-                CompletionEvent(
-                    event_id=event.event_id,
-                    certificate_id=event.certificate_id,
-                    status=decision.next_state.value,
-                    retry_count=lifecycle.retry_count,
-                    error=lifecycle.last_error,
-                )
-            )

@@ -5,7 +5,6 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from cert_orchestrator.config import Settings
-from cert_orchestrator.messaging import rabbitmq as rabbitmq_module
 from cert_orchestrator.messaging.rabbitmq import RabbitMQClient
 
 
@@ -221,17 +220,16 @@ class TestSecretHandling:
 class TestRabbitMQClient:
     """Test RabbitMQClient integration."""
 
-    def test_rabbitmq_client_uses_resolved_url(self, clean_env, monkeypatch):
-        """RabbitMQClient() with no argument uses settings.resolved_rabbitmq_url."""
+    def test_rabbitmq_client_uses_default_config(self, clean_env):
+        """RabbitMQClient() with no arg uses default settings."""
         clean_env.setenv("CERT_ORCH_RABBITMQ_HOST", "myhost")
         clean_env.setenv("CERT_ORCH_RABBITMQ_PORT", "5673")
-        test_settings = Settings()
-        monkeypatch.setattr(rabbitmq_module, "settings", test_settings)
         client = RabbitMQClient()
-        assert client.url == test_settings.resolved_rabbitmq_url
+        expected_url = Settings().resolved_rabbitmq_url
+        assert client.url == expected_url
 
-    def test_rabbitmq_client_uses_explicit_url(self, clean_env):
-        """RabbitMQClient(url="...") uses the provided URL."""
-        explicit_url = "amqp://custom:pass@custom.host:9999/vhost"
-        client = RabbitMQClient(url=explicit_url)
-        assert client.url == explicit_url
+    def test_rabbitmq_client_uses_explicit_config(self, clean_env):
+        """RabbitMQClient(config=...) uses the provided config."""
+        custom_settings = Settings(rabbitmq_host="custom.host", rabbitmq_port=9999)
+        client = RabbitMQClient(config=custom_settings)
+        assert client.url == custom_settings.resolved_rabbitmq_url
