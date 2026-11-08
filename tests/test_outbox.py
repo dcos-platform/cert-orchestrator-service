@@ -2,13 +2,17 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from cert_orchestrator import models
 from cert_orchestrator.messaging.inbound import HEADER_CORRELATION_ID
 from cert_orchestrator.models import OutboxKind, OutboxMessage, OutboxState
 from cert_orchestrator.persistence.outbox import OutboxRepository, relay_backoff_seconds
 from cert_orchestrator.schemas import CompletionEvent
+
+T0 = datetime(2026, 11, 8, 12, 0, tzinfo=UTC)
 
 
 def completion_event(event_id: str = "evt-1") -> CompletionEvent:
@@ -117,9 +121,10 @@ def test_claim_returns_only_due_pending_rows_in_id_order_up_to_the_limit(db_sess
     enqueue_completion(db_session, "evt-e")
     db_session.commit()
 
+    # Claim after the rows exist: they are stamped with the application clock when inserted, which is after `now`.
     repository = OutboxRepository(db_session)
-    everything_due = [row.message_id for row in repository.claim_pending(10, now)]
-    two_at_most = [row.message_id for row in repository.claim_pending(2, now)]
+    everything_due = [row.message_id for row in repository.claim_pending(10, datetime.now(UTC))]
+    two_at_most = [row.message_id for row in repository.claim_pending(2, datetime.now(UTC))]
 
     assert everything_due == ["evt-a", "evt-d", "evt-e"]
     assert two_at_most == ["evt-a", "evt-d"]
@@ -170,3 +175,73 @@ def test_mark_attempt_failed_counts_the_attempt_and_holds_the_row_back(db_sessio
 )
 def test_relay_backoff_doubles_from_base_and_is_capped(attempt_count, base, cap, expected):
     assert relay_backoff_seconds(attempt_count, base, cap) == expected
+
+
+def test_application_clock_stamps_available_at_and_created_at_on_insert(db_session, freeze_clock):
+    freeze_clock(models, T0)
+
+    row = enqueue_completion(db_session, "evt-clock")
+
+    assert row.available_at == T0
+    assert row.created_at == T0
+
+
+def test_pending_backlog_counts_each_kind_and_ages_the_oldest_pending_row(db_session, freeze_clock):
+    repository = OutboxRepository(db_session)
+    freeze_clock(models, T0 - timedelta(minutes=10))
+    sent = repository.enqueue_completion(completion_event("evt-old-sent"), None)
+    repository.mark_sent(sent, T0)
+    freeze_clock(models, T0)
+    repository.enqueue_completion(completion_event("evt-a"), None)
+    repository.enqueue_retry({"event_id": "evt-b:retry:1"}, 5, {})
+    db_session.commit()
+
+    backlog = repository.pending_backlog(T0 + timedelta(seconds=30))
+
+    assert backlog.pending_by_kind == {OutboxKind.COMPLETION: 1, OutboxKind.RETRY: 1}
+    assert backlog.oldest_age_seconds == 30.0
+
+
+def test_pending_backlog_takes_the_age_from_the_oldest_row_of_either_kind(db_session, freeze_clock):
+    freeze_clock(models, T0 - timedelta(seconds=100))
+    OutboxRepository(db_session).enqueue_retry({"event_id": "evt-r:retry:1"}, 5, {})
+    freeze_clock(models, T0)
+    OutboxRepository(db_session).enqueue_completion(completion_event("evt-c"), None)
+    db_session.commit()
+
+    backlog = OutboxRepository(db_session).pending_backlog(T0)
+
+    assert backlog.pending_by_kind == {OutboxKind.COMPLETION: 1, OutboxKind.RETRY: 1}
+    assert backlog.oldest_age_seconds == 100.0
+
+
+def test_pending_backlog_reports_every_kind_as_zero_and_age_zero_when_nothing_waits(db_session):
+    backlog = OutboxRepository(db_session).pending_backlog(T0)
+
+    assert backlog.pending_by_kind == {kind: 0 for kind in OutboxKind}
+    assert backlog.oldest_age_seconds == 0.0
+
+
+def test_pending_backlog_age_is_never_negative(db_session, freeze_clock):
+    freeze_clock(models, T0)
+    enqueue_completion(db_session, "evt-future")
+    db_session.commit()
+
+    backlog = OutboxRepository(db_session).pending_backlog(T0 - timedelta(seconds=5))
+
+    assert backlog.oldest_age_seconds == 0.0
+
+
+def test_pending_backlog_is_a_single_statement(sqlite_engine, db_session):
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+        statements.append(statement)
+
+    event.listen(sqlite_engine, "before_cursor_execute", record)
+    try:
+        OutboxRepository(db_session).pending_backlog(T0)
+    finally:
+        event.remove(sqlite_engine, "before_cursor_execute", record)
+
+    assert len(statements) == 1

@@ -2,23 +2,28 @@
 
 ## Overview
 
-A FastAPI service that consumes certificate lifecycle events from RabbitMQ, processes them through a state machine, persists state to PostgreSQL, and publishes completion events. **The plumbing works; the business logic is a placeholder.** `handlers.py` decides completion vs. failure from `payload["should_fail"]`; no certificate work is performed. By owner decision of 2026-10-04 (D1(c)), the work stays a documented no-op. Story 4 (complete) added routing-key operation awareness: each cert-api operation has its own lifecycle record, and only create and renew produce a completion. Story 5 replaces publish-then-commit with a transactional outbox: the handler writes each completion and business retry in its database transaction, and a relay publishes it with broker confirms. This service must not become a CA integration.
+A FastAPI service that consumes certificate lifecycle events from RabbitMQ, processes them through a state machine, persists state to PostgreSQL, and publishes completion events. **The plumbing works; the business logic is a placeholder.** `handlers.py` decides completion vs. failure from `payload["should_fail"]`; no certificate work is performed. By owner decision of 2026-10-04 (D1(c)), the work stays a documented no-op. Story 4 (complete) added routing-key operation awareness: each cert-api operation has its own lifecycle record, and only create and renew produce a completion. Story 5 replaces publish-then-commit with a transactional outbox: the handler writes each completion and business retry in its database transaction, and a relay publishes it with broker confirms. Story 6 (observability) adds JSON logs in cert-api's shape with the correlation id on every line that handles an event or outbox row, Prometheus metrics at `/metrics`, and the Story 5 carry-overs (one clock for outbox timing; throttled relay failure logging). This service must not become a CA integration.
 
 ## Current Limitations
 
 - **Coverage metrics:** The codebase floor (`fail_under`) and the coverage bar are **combined** coverage: coverage.py's total with `branch = true`, which counts lines and branches together (the same basis as SonarCloud's "Coverage"). The new-code gate (`diff-cover`) measures changed lines. Branch-only coverage is quoted in each story's evidence but is not enforced.
 - **Outbox retention:** `SENT` rows are kept. Nothing deletes or archives them yet (D-S5-5), so `outbox_messages` grows with every completion and business retry until a cleanup is added.
+- **`/metrics` is unauthenticated** (platform deviation 4 in `CLAUDE.md`). It is for the internal network only.
 
 ## Architecture
 
 **Components:**
 
-- `cert_orchestrator/main.py` — FastAPI app, lifespan management; starts and stops the outbox relay task.
+- `cert_orchestrator/main.py` — FastAPI app, lifespan management (re-applies JSON logging, starts and stops the outbox relay task); `/healthz` and `/metrics` routes.
+- `cert_orchestrator/logging_config.py` — `JsonFormatter` (one JSON object per line, cert-api's field set) and `configure_logging()`.
+- `cert_orchestrator/logging_context.py` — the correlation context: `CONTEXT_FIELDS`, `log_context()` (set and restore per block, in `contextvars`) and `ContextFilter` (copies the context onto each record; installed on the handler).
+- `cert_orchestrator/metrics.py` — the nine Prometheus metrics, their closed label sets, and the typed helpers that record them.
+- `cert_orchestrator/messaging/rabbitmq.py` — RabbitMQ consumer: per-delivery log context, dead-lettering, transport retry, and their counters.
 - `cert_orchestrator/messaging/handlers.py` — RabbitMQ message handler, orchestration flow. Writes outbox rows; never touches the broker.
-- `cert_orchestrator/messaging/relay.py` — outbox relay: claims due rows, publishes each with a broker confirm, marks it `SENT` or schedules a retry with backoff.
+- `cert_orchestrator/messaging/relay.py` — outbox relay: claims due rows, publishes each with a broker confirm, marks it `SENT` or schedules a retry with backoff; refreshes the outbox gauges once per pass.
 - `cert_orchestrator/state_machine.py` — transition decisions (`PROCESSING` = retry scheduled, `COMPLETED`, `FAILED` = retries exhausted), and which operations produce a completion.
 - `cert_orchestrator/persistence/repository.py` — SQLAlchemy persistence, idempotency guard (`processed_events`), per-operation lifecycle records.
-- `cert_orchestrator/persistence/outbox.py` — outbox persistence (`outbox_messages`): enqueue (handler), claim and mark (relay), and `relay_backoff_seconds`.
+- `cert_orchestrator/persistence/outbox.py` — outbox persistence (`outbox_messages`): enqueue (handler), claim and mark (relay), `pending_backlog` (one aggregate query for the gauges), and `relay_backoff_seconds`.
 - `alembic/` — schema migrations for PostgreSQL lifecycle tables (`0001` creates them; `0002` adds per-operation records; `0003` adds the outbox table).
 
 **Wire contract:** Snake_case envelope in (from cert-api 1.0.0), `CompletionEvent` out. Fixed and owned by cert-api.
@@ -79,13 +84,88 @@ Two kinds of retry exist:
 
 **Transactional outbox (Story 5):** The handler never touches the broker. For each completion or business retry it writes one `outbox_messages` row in the same transaction as the `processed_events` row and the lifecycle change. Revoke and expire write no row. The row holds the exact body and headers to publish, fixed at write time. The destination is derived at publish time from the row's kind and delay (the completion queue for completions; the wait queue for `delay_seconds` for retries), so a configuration change applies to rows still pending. After the handler's commit succeeds and a row was written, it wakes the relay.
 
-**Relay:** `OutboxRelay` is a task started by the application lifespan. Each pass runs in one transaction: it claims up to `CERT_ORCH_OUTBOX_BATCH_SIZE` due `PENDING` rows (`available_at <= now`, ordered by id) with `FOR UPDATE SKIP LOCKED`, publishes each with a broker confirm, and sets `SENT` and `sent_at` only after the confirm. A failed publish increments `attempt_count`, stores `last_error`, and sets `available_at` to now plus a capped exponential backoff (`CERT_ORCH_OUTBOX_BACKOFF_BASE_SECONDS` doubling per attempt, capped at `CERT_ORCH_OUTBOX_BACKOFF_MAX_SECONDS`). The relay never gives up: a row is retried until it is published. At `CERT_ORCH_OUTBOX_ALERT_AFTER_ATTEMPTS` attempts the relay logs one ERROR for that row. A pass runs after each wake and otherwise every `CERT_ORCH_OUTBOX_POLL_INTERVAL_SECONDS`. A pass that raises is logged at ERROR with its traceback and the loop continues. On shutdown the relay is stopped and waited for up to a bounded time, then cancelled.
+**Relay:** `OutboxRelay` is a task started by the application lifespan. Each pass runs in one transaction: it claims up to `CERT_ORCH_OUTBOX_BATCH_SIZE` due `PENDING` rows (`available_at <= now`, ordered by id) with `FOR UPDATE SKIP LOCKED`, publishes each with a broker confirm, and sets `SENT` and `sent_at` only after the confirm. A failed publish increments `attempt_count`, stores `last_error`, and sets `available_at` to now plus a capped exponential backoff (`CERT_ORCH_OUTBOX_BACKOFF_BASE_SECONDS` doubling per attempt, capped at `CERT_ORCH_OUTBOX_BACKOFF_MAX_SECONDS`). The relay never gives up: a row is retried until it is published. At `CERT_ORCH_OUTBOX_ALERT_AFTER_ATTEMPTS` attempts the relay logs one ERROR for that row. A pass runs after each wake and otherwise every `CERT_ORCH_OUTBOX_POLL_INTERVAL_SECONDS`. On shutdown the relay is stopped and waited for up to a bounded time, then cancelled.
+
+**Relay failure logging (Story 6):** A pass that raises is counted in `cert_orchestrator_relay_pass_failures_total` every time. It is logged at ERROR with its traceback on the first failure of an outage, then at most once per `CERT_ORCH_RELAY_FAILURE_LOG_INTERVAL_SECONDS` while passes keep failing. The first successful pass after an outage logs one INFO line, `Outbox relay recovered`; a later outage starts again with an immediate ERROR.
+
+**Outbox timing (Story 6):** `available_at` and `created_at` are stamped by the application clock when a row is inserted, and claims and backoffs use the same clock. The database default (`now()`) is kept in the migration for rows inserted outside the ORM, and `alembic check` reports no drift.
 
 **Delivery guarantee:** At-least-once. A crash after a confirmed publish and before the mark-sent commit republishes the row on the next pass with the same `message_id`. Duplicates are absorbed downstream: cert-api dedupes completions on `event_id`, and a duplicated business retry is dropped by this service's own `processed_events` guard.
 
-**Completion message ids and correlation (D-S5-1, D-S5-2):** A completion's AMQP `message_id` is its `event_id`, the id of the attempt that finished (`<root>` for the first attempt, `<root>:retry:N` for a retried one). Its `x-correlation-id` header follows cert-api's rule: the inbound `x-correlation-id` if valid, else the root event id if valid, else the header is omitted. Valid means a non-blank string whose length is at most 36 UTF-16 code units, which is how cert-api's `LoggingContext` counts. The rule is `completion_correlation_id` in `messaging/inbound.py`.
+**Completion message ids and correlation (D-S5-1, D-S5-2):** A completion's AMQP `message_id` is its `event_id`, the id of the attempt that finished (`<root>` for the first attempt, `<root>:retry:N` for a retried one). Its `x-correlation-id` header follows cert-api's rule: the inbound `x-correlation-id` if valid, else the root event id if valid, else the header is omitted. Valid means a non-blank string whose length is at most 36 UTF-16 code units, which is how cert-api's `LoggingContext` counts. The rule is `completion_correlation_id` in `messaging/inbound.py`; the inbound-only part is `inbound_correlation_id`.
 
 **Known limitation:** The outbox covers handler-produced completions and business retries only. The consumer's own republishes (transport retries and dead-letters) remain publish-then-ack: a message is acknowledged only after its republish has been confirmed by the broker. If that republish itself fails (the broker is refusing publishes), the message is logged at ERROR and nack(requeue=True) is called. This can redeliver the message in a tight loop until the broker recovers.
+
+## Logging
+
+Every line the process writes is one JSON object (D-S6-3: always JSON, there is no plain-text mode). The formatter is `JsonFormatter` in `logging_config.py`; uvicorn's and alembic's loggers route through the root, so their lines are JSON too. JSON is applied at import and again at the start of the lifespan, because uvicorn applies its logging config when its Config is created: before this module's import under `uvicorn module:app`, but after it when a program imports the app and calls uvicorn.run(app). This call covers the second case.
+
+**Field set and order (exactly these keys, no others):**
+
+| Key | Value |
+|---|---|
+| `timestamp` | UTC, milliseconds, `Z` suffix, from the record's creation time (e.g. `2026-11-08T17:04:49.307Z`) |
+| `version` | `"1"` |
+| `level` | Logback names: `WARNING` → `WARN`, `CRITICAL` → `ERROR`, otherwise the Python level name |
+| `severity` | Logback numbers: DEBUG 10000, INFO 20000, WARN 30000, ERROR/CRITICAL 40000 |
+| `thread`, `logger`, `message` | thread name, logger name, formatted message |
+| `exception` | only when the record carries one |
+| `correlationId`, `certificateId`, `eventId`, `operation` | the correlation context; each only when set |
+| `state`, `reason`, `kind` | passed per line via `extra`; each only when set |
+
+Field names are camelCase because they match cert-api's MDC names (D-S6-1), so one query (`correlationId="…"`) finds the lines for one id in both services. cert-api's own key order differs (measured: timestamp, version, message, logger, thread, level, severity, then its MDC keys); key order carries no meaning and queries go by field name.
+
+**Where the context is set:** The consumer sets `correlationId` (the inbound `x-correlation-id` if valid) and `eventId` (the body's `event_id`) for the whole handling of a delivery. The handler sets `certificateId`, `eventId`, `operation`, and `correlationId` (the same value stored on the completion's outbox row). The relay sets `correlationId` and `eventId` (the row's message id) for each row. Context lives in `contextvars` and is restored when each block exits, so concurrent messages never see each other's ids.
+
+**Lines this service writes for an event or outbox row:**
+
+| Message | Level | Extra keys |
+|---|---|---|
+| `Processed lifecycle event` | INFO | `state` |
+| `Skipping duplicate event` | INFO | — |
+| `Outbox message published` | INFO | `kind` |
+| `Outbox publish failed; will retry` | WARN | `kind` |
+| `Outbox message <id> not published after N attempts` | ERROR | `kind` |
+| `Outbox relay pass failed` | ERROR (with traceback) | — |
+| `Outbox relay recovered` | INFO | — |
+| `Failed to dead-letter message` | ERROR (with traceback) | `reason` |
+| `Failed to handle transport error (<action>)` | ERROR (with traceback) | — |
+| `Transport retry scheduled (attempt N of M, delay S s)` | WARN (with traceback, the handler's error) | — |
+| `Message dead-lettered` | ERROR (with traceback) when `reason` is `EXHAUSTED`; otherwise WARN with no traceback | `reason` |
+
+Both lines are written after the broker confirms the publish, so a line never claims a retry or dead letter that did not happen. A failed publish writes only the `Failed to …` line above. The `INVALID` and `UNSUPPORTED_OPERATION` lines carry no exception, so no validation error's text (which quotes its input) is logged; database error text names the statement but not its parameters (`hide_parameters=True` in `db.py`), so a traceback does not carry the body either.
+
+A line from the Story 6 end-to-end run:
+
+```json
+{"timestamp": "2026-11-08T17:04:49.307Z", "version": "1", "level": "INFO", "severity": 20000, "thread": "MainThread", "logger": "cert_orchestrator.messaging.handlers", "message": "Processed lifecycle event", "correlationId": "429b1194-3547-45bf-9b77-a45a9dec75fb", "certificateId": "1084fd79-193f-47fe-963e-569ff288832b", "eventId": "8e568c6e-f32b-41b5-b66e-e76aa44db8d1", "operation": "CREATE", "state": "COMPLETED"}
+```
+
+**Following one correlation id across both services:** Search both containers' logs for the id, with `docker logs <container> 2>&1 | grep -F '<id>'` for each container. The orchestrator logs to stderr, hence `2>&1`; the two services separate JSON differently (`"correlationId": "<id>"` here, `"correlationId":"<id>"` in cert-api), so search for the id rather than the quoted key. Three conditions apply to cert-api 1.0.0 (the published image, run by digest):
+
+- It writes JSON only under the `prod` profile. Run it with `SPRING_PROFILES_ACTIVE=prod`; without it the image writes plain text.
+- At its default levels it writes **no line for a create request**: the HTTP response echoes the id, and the first lines under the id are the completion's. To see the request line, run it with `LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_WEB_SERVLET=DEBUG`. That is configuration of the published image, not a change to cert-api.
+- Its exception field is written as `stack_trace`, not `exception`. Its `logback-spring.xml` declares `exception`, but Logback ignores that name at startup (`Ignoring unknown property [exception]`). This service writes `exception`, following the plan and cert-api's declared intent.
+
+In the Story 6 end-to-end run, cert-api's create request line, `Completion event received` and `Certificate orchestration status updated` lines, and the orchestrator's `Processed lifecycle event` and `Outbox message published` lines all carried the same `correlationId`.
+
+## Metrics
+
+`GET /metrics` (`main.py`, the same port as `/healthz`) returns the Prometheus text format (`text/plain; version=0.0.4`). It is unauthenticated, for the internal network (platform deviation 4), and never queries the database. Names are declared with the prefix `cert.orchestrator.` and exposed as `cert_orchestrator_…` (D-S6-2; cert-api's own prefix is `cert.`). The dependency is `prometheus-client`.
+
+| Exposed name | Type | Labels | Moves when |
+|---|---|---|---|
+| `cert_orchestrator_events_consumed_total` | counter | `operation`, `outcome` | `processed` and `duplicate` in the handler; `dead_lettered` after the dead-letter publish returns; `transport_retry` after the wait-queue publish returns |
+| `cert_orchestrator_event_processing_seconds` | histogram | `operation` | every handling that passed validation, including one that raises |
+| `cert_orchestrator_lifecycle_transitions_total` | counter | `operation`, `state` | after the handler's commit succeeds (a rolled-back handling counts nothing) |
+| `cert_orchestrator_dead_letters_total` | counter | `reason` | after the dead-letter publish returns |
+| `cert_orchestrator_outbox_published_total` | counter | `kind` | after the broker confirms a publish |
+| `cert_orchestrator_outbox_publish_failures_total` | counter | `kind` | on each failed publish |
+| `cert_orchestrator_outbox_pending` | gauge | `kind` | once per relay pass, after its commit |
+| `cert_orchestrator_outbox_oldest_pending_age_seconds` | gauge | — | once per relay pass, after its commit; `0` when nothing waits |
+| `cert_orchestrator_relay_pass_failures_total` | counter | — | on every failed relay pass, whatever the log throttle does |
+
+**Closed label sets:** `operation` is `CREATE`, `RENEW`, `REVOKE` or `EXPIRE` (plus `unknown` on `events_consumed_total` only, for a routing key that is not one of the four); `outcome` is `processed`, `duplicate`, `dead_lettered` or `transport_retry`; `state` is `PENDING`, `PROCESSING`, `COMPLETED` or `FAILED`; `reason` is `INVALID`, `EXHAUSTED` or `UNSUPPORTED_OPERATION`; `kind` is `COMPLETION` or `RETRY`. Every combination is created at import, so each exports `0` until it moves. No certificate id, event id, correlation id, subject, error text or queue name is ever a label value, and there is no database-latency metric.
 
 ## Configuration
 
@@ -114,6 +194,11 @@ All configuration is environment-driven via `Settings` in `cert_orchestrator/con
 | `CERT_ORCH_OUTBOX_BACKOFF_BASE_SECONDS` | `float` | `1.0` |
 | `CERT_ORCH_OUTBOX_BACKOFF_MAX_SECONDS` | `float` | `60.0` |
 | `CERT_ORCH_OUTBOX_ALERT_AFTER_ATTEMPTS` | `int` | `5` |
+| `CERT_ORCH_RELAY_FAILURE_LOG_INTERVAL_SECONDS` | `float` | `60.0` |
+
+## Dependencies
+
+Runtime (`pyproject.toml` `dependencies`): `fastapi`, `uvicorn`, `sqlalchemy`, `psycopg[binary]`, `alembic`, `pydantic`, `pydantic-settings`, `aio-pika`, and `prometheus-client` (Story 6, `>=0.26.0`). Test extras are unchanged.
 
 ## Quality Gates
 
@@ -137,6 +222,8 @@ pip install -e .[test]
 CERT_ORCH_POSTGRES_HOST=<host> CERT_ORCH_RABBITMQ_HOST=<host> alembic upgrade head
 CERT_ORCH_POSTGRES_HOST=<host> CERT_ORCH_RABBITMQ_HOST=<host> uvicorn cert_orchestrator.main:app --host 0.0.0.0 --port 8000
 ```
+
+The plain `uvicorn` command needs no `--log-config` and no `--no-access-log`: the service applies its JSON logging itself, at import and again in the lifespan.
 
 With dcos-infra: there is no image yet (the Dockerfile arrives in Story 7), so run from source in a stock Python container on `dcos-net`. Run this from PowerShell, not Git Bash, because Git Bash rewrites container paths:
 
@@ -162,7 +249,7 @@ pytest tests --cov=cert_orchestrator --cov-report=term-missing
 | Story 3 | Complete | DLQ, redelivery, routing key, headers, retry backoff. Wait queues with TTL. Publish-then-commit. Coverage floor: 93% (branch coverage; 93.65% measured). |
 | Story 4 | Complete | Operation awareness: routing key → operation; create and renew orchestrated with a completion; revoke and expire recorded with none. Per-operation lifecycle records keyed by `root_event_id` (migration `0002`). `PROCESSING` = retry scheduled. Unsupported `cert.*` keys dead-lettered (`UNSUPPORTED_OPERATION`). `alembic check` in CI. Five Story 3 carry-overs. Coverage floor: 94% combined (94.96% measured; branch-only 68/68 = 100.00%; lines 403/428 = 94.16%). |
 | Story 5 | Complete | Transactional outbox for completions and business retries: the handler writes `outbox_messages` rows in its transaction, and a relay publishes them with broker confirms, retrying with capped backoff. Migration `0003` (unique `(kind, message_id)`). Completions carry `message_id` = event id and the `x-correlation-id` rule. Coverage floor: 95% combined (100.00% measured; branch-only 82/82 = 100.00%; lines 591/591 = 100.00%). |
-| Story 6 | Pending | Metrics, logging changes. |
+| Story 6 | Complete | JSON logs in cert-api's shape with the correlation id on every line that handles an event or outbox row (`logging_config.py`, `logging_context.py`); `/metrics` with nine bounded metrics (`metrics.py`); outbox timing on the application clock; relay failure logging throttled with one recovery line. One correlation id traced across both services' logs, proved end to end against cert-api 1.0.0. Migrations unchanged (`alembic check` clean). Consumer dead-letter and transport-retry lines (Addendum A). Coverage floor: 95% combined (100.00% measured; branch-only 120/120 = 100.00%; lines 797/797 = 100.00%). |
 | Story 7 | Pending | Dockerfile, image publish. |
 | Story 8 | Pending | Version bump. |
 

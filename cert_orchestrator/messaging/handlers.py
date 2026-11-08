@@ -3,6 +3,7 @@ from collections.abc import Callable
 
 from cert_orchestrator.config import settings
 from cert_orchestrator.db import get_session
+from cert_orchestrator.logging_context import log_context
 from cert_orchestrator.messaging.inbound import (
     HEADER_ROOT_EVENT_ID,
     InboundMessage,
@@ -10,7 +11,8 @@ from cert_orchestrator.messaging.inbound import (
     completion_correlation_id,
     operation_for_routing_key,
 )
-from cert_orchestrator.models import CertificateLifecycle, LifecycleState
+from cert_orchestrator.metrics import ConsumeOutcome, record_event_consumed, record_transition, time_event_processing
+from cert_orchestrator.models import CertificateLifecycle, LifecycleOperation, LifecycleState
 from cert_orchestrator.persistence.outbox import OutboxRepository
 from cert_orchestrator.persistence.repository import LifecycleRepository
 from cert_orchestrator.schemas import CertificateLifecycleEvent, CompletionEvent
@@ -32,37 +34,49 @@ class LifecycleMessageHandler:
         operation = operation_for_routing_key(message.routing_key)
         event = CertificateLifecycleEvent.model_validate(message.body)
         root_event_id = message.headers.get(HEADER_ROOT_EVENT_ID, event.event_id)
+        with (
+            log_context(
+                correlationId=completion_correlation_id(message.headers, root_event_id),
+                certificateId=event.certificate_id,
+                eventId=event.event_id,
+                operation=operation.value,
+            ),
+            time_event_processing(operation),
+        ):
+            self._process(message, operation, event, root_event_id)
 
+    def _process(
+        self,
+        message: InboundMessage,
+        operation: LifecycleOperation,
+        event: CertificateLifecycleEvent,
+        root_event_id: str,
+    ) -> None:
+        """Apply one validated event in a single transaction, then count and log what it did."""
+        orchestrated = completion_required(operation)
         with get_session() as session:
             repository = LifecycleRepository(session)
             is_new = repository.mark_event_if_new(event.event_id, event.certificate_id)
             if not is_new:
-                logger.info(
-                    "Skipping duplicate event",
-                    extra={"event_id": event.event_id, "certificate_id": event.certificate_id},
-                )
+                logger.info("Skipping duplicate event")
+                record_event_consumed(operation, ConsumeOutcome.DUPLICATE)
                 return
 
             lifecycle = repository.get_or_create_operation(root_event_id, event.certificate_id, operation)
             outbox = OutboxRepository(session)
-            outbox_written = completion_required(operation)
-            if outbox_written:
+            if orchestrated:
                 state = self._orchestrate(repository, outbox, lifecycle, event, message, root_event_id)
             else:
                 repository.mark_completed(lifecycle)
                 state = LifecycleState.COMPLETED
             session.commit()
 
-        if outbox_written and self.wake is not None:
+        # Counted only now: the commit succeeded, so the transition and the processing really happened.
+        record_event_consumed(operation, ConsumeOutcome.PROCESSED)
+        record_transition(operation, state)
+        if orchestrated and self.wake is not None:
             self.wake()
-        logger.info(
-            "Processed lifecycle event",
-            extra={
-                "event_id": event.event_id,
-                "certificate_id": event.certificate_id,
-                "state": state.value,
-            },
-        )
+        logger.info("Processed lifecycle event", extra={"state": state.value})
 
     def _orchestrate(
         self,

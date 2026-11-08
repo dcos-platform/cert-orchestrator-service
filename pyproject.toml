@@ -16,7 +16,8 @@ dependencies = [
   "alembic>=1.13.2",
   "pydantic>=2.8.2",
   "pydantic-settings>=2.3.4",
-  "aio-pika>=9.4.2"
+  "aio-pika>=9.4.2",
+  "prometheus-client>=0.26.0"
 ]
 
 [project.optional-dependencies]

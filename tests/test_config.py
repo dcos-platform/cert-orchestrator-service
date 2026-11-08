@@ -246,6 +246,7 @@ class TestOutboxSettings:
             ("outbox_backoff_base_seconds", 1.0),
             ("outbox_backoff_max_seconds", 60.0),
             ("outbox_alert_after_attempts", 5),
+            ("relay_failure_log_interval_seconds", 60.0),
         ],
     )
     def test_default_value(self, clean_env, field, default):
@@ -262,6 +263,7 @@ class TestOutboxSettings:
             ("CERT_ORCH_OUTBOX_BACKOFF_BASE_SECONDS", "2", "outbox_backoff_base_seconds", 2.0),
             ("CERT_ORCH_OUTBOX_BACKOFF_MAX_SECONDS", "120", "outbox_backoff_max_seconds", 120.0),
             ("CERT_ORCH_OUTBOX_ALERT_AFTER_ATTEMPTS", "3", "outbox_alert_after_attempts", 3),
+            ("CERT_ORCH_RELAY_FAILURE_LOG_INTERVAL_SECONDS", "15", "relay_failure_log_interval_seconds", 15.0),
         ],
     )
     def test_each_value_is_overridable_from_its_environment_variable(self, clean_env, env_name, raw, field, expected):

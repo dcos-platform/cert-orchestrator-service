@@ -3,7 +3,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from cert_orchestrator.config import settings
 from cert_orchestrator.db import SessionLocal
@@ -11,6 +11,7 @@ from cert_orchestrator.logging_config import configure_logging
 from cert_orchestrator.messaging.handlers import LifecycleMessageHandler
 from cert_orchestrator.messaging.rabbitmq import RabbitMQClient
 from cert_orchestrator.messaging.relay import OutboxRelay
+from cert_orchestrator.metrics import METRICS_CONTENT_TYPE, render_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,11 @@ configure_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Connect to RabbitMQ, run the outbox relay and consume lifecycle events until shutdown."""
+    """Re-apply JSON logging, connect to RabbitMQ, run the outbox relay and consume lifecycle events until shutdown."""
+    # Uvicorn applies its logging config when its Config is created: before this module's import under
+    # `uvicorn module:app`, but after it when a program imports the app and calls uvicorn.run(app). This call covers the
+    # second case.
+    configure_logging()
     rabbitmq = RabbitMQClient()
     await rabbitmq.connect()
     app.state.rabbitmq = rabbitmq
@@ -56,3 +61,9 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def scrape_metrics() -> Response:
+    """Return the Prometheus metrics. Unauthenticated, on the internal network (platform deviation 4)."""
+    return Response(content=render_metrics(), media_type=METRICS_CONTENT_TYPE)

@@ -1,11 +1,14 @@
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aio_pika
 import pytest
+from pydantic import ValidationError
 
 from cert_orchestrator.config import Settings
 from cert_orchestrator.messaging.inbound import (
     HEADER_ATTEMPT,
+    HEADER_CORRELATION_ID,
     HEADER_DEAD_LETTER_REASON,
     HEADER_EXCEPTION_MESSAGE,
     HEADER_ORIGINAL_EXCHANGE,
@@ -16,6 +19,7 @@ from cert_orchestrator.messaging.inbound import (
 )
 from cert_orchestrator.messaging.rabbitmq import RabbitMQClient
 from cert_orchestrator.models import OutboxKind, OutboxMessage, OutboxState
+from cert_orchestrator.schemas import CertificateLifecycleEvent
 
 
 @pytest.fixture
@@ -196,7 +200,7 @@ async def test_transport_retry_increments_attempt(client):
 
     retry_calls = []
 
-    async def capture_retry(msg, inbound, attempt):
+    async def capture_retry(msg, inbound, attempt, exception):
         retry_calls.append(attempt)
 
     with patch.object(client, "_schedule_transport_retry", side_effect=capture_retry):
@@ -558,7 +562,7 @@ async def test_schedule_transport_retry_without_channel():
     inbound = MagicMock()
 
     with pytest.raises(RuntimeError, match="RabbitMQ channel is not initialized"):
-        await client._schedule_transport_retry(message, inbound, 1)
+        await client._schedule_transport_retry(message, inbound, 1, ValueError("handler failed"))
 
 
 @pytest.mark.asyncio
@@ -647,7 +651,7 @@ async def test_schedule_transport_retry_header_already_set_original_routing_key(
 
     client.channel.default_exchange.publish = capture_publish
 
-    await client._schedule_transport_retry(message, inbound, 1)
+    await client._schedule_transport_retry(message, inbound, 1, ValueError("handler failed"))
 
     assert len(published_msgs) == 1
     headers = published_msgs[0]
@@ -682,7 +686,7 @@ async def test_schedule_transport_retry_header_already_set_original_exchange(cli
 
     client.channel.default_exchange.publish = capture_publish
 
-    await client._schedule_transport_retry(message, inbound, 1)
+    await client._schedule_transport_retry(message, inbound, 1, ValueError("handler failed"))
 
     assert len(published_msgs) == 1
     headers = published_msgs[0]
@@ -817,7 +821,7 @@ async def test_transport_retry_keeps_original_message_id_and_correlation_id(clie
     message.correlation_id = "corr-original"
     inbound = InboundMessage(body={"key": "value"}, routing_key="cert.created", headers={}, exchange="test.exchange")
 
-    await client._schedule_transport_retry(message, inbound, 1)
+    await client._schedule_transport_retry(message, inbound, 1, ValueError("handler failed"))
 
     published_message = published[0][0]
     assert published_message.message_id == "msg-original"
@@ -909,3 +913,366 @@ async def test_publish_outbox_message_propagates_a_broker_refusal(client):
 
     with pytest.raises(ConnectionError, match="broker refused"):
         await client.publish_outbox_message(row)
+
+
+CONSUMED_TOTAL = "cert_orchestrator_events_consumed_total"
+DEAD_LETTERS_TOTAL = "cert_orchestrator_dead_letters_total"
+
+
+def _wire_delivery(client: RabbitMQClient, message: MagicMock) -> AsyncMock:
+    """Deliver the message to the consumer, and give the channel a default exchange and a dead-letter exchange."""
+    channel = _wire_consume(client, message)
+    channel.default_exchange = AsyncMock()
+    channel.default_exchange.publish = AsyncMock()
+    dlx = AsyncMock()
+    dlx.publish = AsyncMock()
+    channel.get_exchange = AsyncMock(return_value=dlx)
+    return channel
+
+
+def _unsupported_handler() -> AsyncMock:
+    return AsyncMock(side_effect=UnsupportedOperationError("unsupported routing key: 'cert.unknown'"))
+
+
+@pytest.mark.asyncio
+async def test_a_failed_dead_letter_logs_its_cause_with_the_delivery_context(client, json_log):
+    message = _incoming(
+        body=b'{"event_id": "evt-dl", "certificate_id": "cert-dl"}',
+        routing_key="cert.unknown",
+        headers={HEADER_CORRELATION_ID: "corr-dl"},
+    )
+    _wire_consume(client, message)
+
+    with patch.object(client, "_dead_letter", side_effect=RuntimeError("broker error")):
+        await client.consume(_unsupported_handler())
+
+    (line,) = [entry for entry in json_log() if entry["message"] == "Failed to dead-letter message"]
+    assert (line["level"], line["correlationId"], line["eventId"], line["reason"]) == (
+        "ERROR",
+        "corr-dl",
+        "evt-dl",
+        "UNSUPPORTED_OPERATION",
+    )
+    assert "RuntimeError: broker error" in line["exception"]
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inbound", ["", "   ", "c" * 37])
+async def test_an_invalid_correlation_header_never_appears_as_correlation_id(client, json_log, inbound):
+    message = _incoming(routing_key="cert.unknown", headers={HEADER_CORRELATION_ID: inbound})
+    _wire_consume(client, message)
+
+    with patch.object(client, "_dead_letter", side_effect=RuntimeError("broker error")):
+        await client.consume(_unsupported_handler())
+
+    (line,) = [entry for entry in json_log() if entry["message"] == "Failed to dead-letter message"]
+    assert "correlationId" not in line
+
+
+@pytest.mark.asyncio
+async def test_an_undecodable_body_logs_with_the_correlation_id_and_no_event_id(client, json_log):
+    message = _incoming(body=b"\xff\xfe", headers={HEADER_CORRELATION_ID: "corr-undecodable"})
+    _wire_consume(client, message)
+
+    with patch.object(client, "_dead_letter", side_effect=RuntimeError("broker error")):
+        await client.consume(AsyncMock())
+
+    (line,) = [entry for entry in json_log() if entry["message"] == "Failed to dead-letter message"]
+    assert line["correlationId"] == "corr-undecodable"
+    assert "eventId" not in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "expected_event_id"),
+    [
+        (b'{"event_id": "evt-ok", "certificate_id": "cert-ok"}', "evt-ok"),
+        (b'{"event_id": "   "}', None),
+        (b'{"event_id": 7}', None),
+        (b"[1, 2]", None),
+        (b"not json", None),
+        (b"\xff", None),
+    ],
+)
+async def test_the_event_id_context_comes_only_from_a_non_blank_string_body_event_id(
+    client, json_log, body, expected_event_id
+):
+    message = _incoming(body=body, routing_key="cert.unknown")
+    _wire_consume(client, message)
+
+    with patch.object(client, "_dead_letter", side_effect=RuntimeError("broker error")):
+        await client.consume(_unsupported_handler())
+
+    (line,) = [entry for entry in json_log() if entry["message"] == "Failed to dead-letter message"]
+    assert line.get("eventId") == expected_event_id
+
+
+@pytest.mark.asyncio
+async def test_a_failed_transport_retry_publish_logs_its_cause_and_moves_no_counter(client, json_log, metric_value):
+    message = _incoming(headers={})
+    channel = _wire_delivery(client, message)
+    channel.default_exchange.publish = AsyncMock(side_effect=ConnectionError("broker refused"))
+    before = metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="transport_retry")
+
+    await client.consume(AsyncMock(side_effect=ValueError("retry")))
+
+    assert metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="transport_retry") == before
+    (line,) = [entry for entry in json_log() if entry["message"] == "Failed to handle transport error (RETRY)"]
+    assert line["level"] == "ERROR"
+    assert "ConnectionError: broker refused" in line["exception"]
+    message.nack.assert_awaited_once_with(requeue=True)
+    message.ack.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_dead_letter_publish_moves_no_dead_letter_counter(client, metric_value):
+    message = _incoming(routing_key="cert.unknown")
+    channel = _wire_delivery(client, message)
+    dlx = AsyncMock()
+    dlx.publish = AsyncMock(side_effect=ConnectionError("broker refused"))
+    channel.get_exchange = AsyncMock(return_value=dlx)
+    reason_before = metric_value(DEAD_LETTERS_TOTAL, reason="UNSUPPORTED_OPERATION")
+    outcome_before = metric_value(CONSUMED_TOTAL, operation="unknown", outcome="dead_lettered")
+
+    await client.consume(_unsupported_handler())
+
+    assert metric_value(DEAD_LETTERS_TOTAL, reason="UNSUPPORTED_OPERATION") == reason_before
+    assert metric_value(CONSUMED_TOTAL, operation="unknown", outcome="dead_lettered") == outcome_before
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+async def test_a_dead_letter_moves_its_reason_and_outcome_counters_once(client, metric_value):
+    message = _incoming(routing_key="cert.unknown")
+    _wire_delivery(client, message)
+    reason_before = metric_value(DEAD_LETTERS_TOTAL, reason="UNSUPPORTED_OPERATION")
+    outcome_before = metric_value(CONSUMED_TOTAL, operation="unknown", outcome="dead_lettered")
+
+    await client.consume(_unsupported_handler())
+
+    assert metric_value(DEAD_LETTERS_TOTAL, reason="UNSUPPORTED_OPERATION") - reason_before == 1
+    assert metric_value(CONSUMED_TOTAL, operation="unknown", outcome="dead_lettered") - outcome_before == 1
+    message.ack.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transport_retry_and_dead_letter_with_a_list_routing_header_count_and_are_acked(client, metric_value):
+    retry_message = _incoming(headers={HEADER_ORIGINAL_ROUTING_KEY: ["cert.created"]})
+    _wire_delivery(client, retry_message)
+    retry_before = metric_value(CONSUMED_TOTAL, operation="unknown", outcome="transport_retry")
+
+    await client.consume(AsyncMock(side_effect=ValueError("retry")))
+
+    assert metric_value(CONSUMED_TOTAL, operation="unknown", outcome="transport_retry") - retry_before == 1
+    retry_message.ack.assert_awaited_once()
+    retry_message.nack.assert_not_called()
+
+    dead_message = _incoming(routing_key="cert.unknown", headers={HEADER_ORIGINAL_ROUTING_KEY: ["cert.created"]})
+    _wire_delivery(client, dead_message)
+    dead_before = metric_value(CONSUMED_TOTAL, operation="unknown", outcome="dead_lettered")
+
+    await client.consume(_unsupported_handler())
+
+    assert metric_value(CONSUMED_TOTAL, operation="unknown", outcome="dead_lettered") - dead_before == 1
+    dead_message.ack.assert_awaited_once()
+    dead_message.nack.assert_not_called()
+
+
+REASONS = ("INVALID", "EXHAUSTED", "UNSUPPORTED_OPERATION")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "body", "routing_key", "headers", "handler_error"),
+    [
+        ("INVALID", b"\xff\xfe", "cert.created", {}, None),
+        ("EXHAUSTED", b'{"key": "value"}', "cert.created", {HEADER_ATTEMPT: 3}, ValueError("boom")),
+        (
+            "UNSUPPORTED_OPERATION",
+            b'{"key": "value"}',
+            "cert.unknown",
+            {},
+            UnsupportedOperationError("unsupported routing key: 'cert.unknown'"),
+        ),
+    ],
+)
+async def test_each_dead_letter_reason_moves_only_its_own_counter(
+    client, metric_value, reason, body, routing_key, headers, handler_error
+):
+    message = _incoming(body=body, routing_key=routing_key, headers=headers)
+    _wire_delivery(client, message)
+    before = {name: metric_value(DEAD_LETTERS_TOTAL, reason=name) for name in REASONS}
+
+    await client.consume(AsyncMock(side_effect=handler_error))
+
+    moved = {name: metric_value(DEAD_LETTERS_TOTAL, reason=name) - before[name] for name in REASONS}
+    assert moved == {name: (1.0 if name == reason else 0.0) for name in REASONS}
+    message.ack.assert_awaited_once()
+    message.nack.assert_not_called()
+
+
+def _dead_letter_lines(json_log) -> list[dict]:
+    return [entry for entry in json_log() if entry["message"] == "Message dead-lettered"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("attempt", "delay"), [(1, 1), (2, 2)])
+async def test_transport_retry_logs_a_warning_with_its_traceback(client, json_log, attempt, delay):
+    message = _incoming(headers={HEADER_ATTEMPT: attempt, HEADER_CORRELATION_ID: "corr-retry"})
+    _wire_delivery(client, message)
+
+    await client.consume(AsyncMock(side_effect=ValueError("handler exploded")))
+
+    (line,) = [entry for entry in json_log() if entry["message"].startswith("Transport retry scheduled")]
+    assert line["message"] == f"Transport retry scheduled (attempt {attempt} of 3, delay {delay} s)"
+    assert (line["level"], line["correlationId"]) == ("WARN", "corr-retry")
+    assert "reason" not in line
+    assert "Traceback (most recent call last)" in line["exception"]
+    assert "ValueError: handler exploded" in line["exception"]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_dead_letter_logs_an_error_with_its_traceback(client, json_log):
+    message = _incoming(headers={HEADER_ATTEMPT: 3, HEADER_CORRELATION_ID: "corr-exhausted"})
+    _wire_delivery(client, message)
+
+    await client.consume(AsyncMock(side_effect=ValueError("final failure")))
+
+    (line,) = _dead_letter_lines(json_log)
+    assert (line["level"], line["severity"], line["reason"], line["correlationId"]) == (
+        "ERROR",
+        40000,
+        "EXHAUSTED",
+        "corr-exhausted",
+    )
+    assert "Traceback (most recent call last)" in line["exception"]
+    assert "ValueError: final failure" in line["exception"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_dead_letter_logs_a_warning_without_a_traceback(client, json_log):
+    message = _incoming(body=b"\xff\xfe", headers={HEADER_CORRELATION_ID: "corr-invalid"})
+    _wire_delivery(client, message)
+
+    await client.consume(AsyncMock())
+
+    (line,) = _dead_letter_lines(json_log)
+    assert (line["level"], line["reason"], line["correlationId"]) == ("WARN", "INVALID", "corr-invalid")
+    assert "exception" not in line
+
+
+@pytest.mark.asyncio
+async def test_unsupported_operation_dead_letter_logs_a_warning_without_a_traceback(client, json_log):
+    message = _incoming(routing_key="cert.unknown", headers={HEADER_CORRELATION_ID: "corr-unsupported"})
+    _wire_delivery(client, message)
+
+    await client.consume(_unsupported_handler())
+
+    (line,) = _dead_letter_lines(json_log)
+    assert (line["level"], line["reason"], line["correlationId"]) == (
+        "WARN",
+        "UNSUPPORTED_OPERATION",
+        "corr-unsupported",
+    )
+    assert "exception" not in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [DeadLetterReason.INVALID, DeadLetterReason.UNSUPPORTED_OPERATION])
+async def test_only_an_exhausted_dead_letter_keeps_a_traceback_when_one_is_handed_over(client, json_log, reason):
+    message = _incoming(routing_key="cert.unknown")
+    _wire_delivery(client, message)
+
+    try:
+        raise ValueError("handed over")
+    except ValueError as error:
+        await client._dead_letter(message, reason, exception=error)
+
+    (line,) = _dead_letter_lines(json_log)
+    assert (line["level"], line["reason"]) == ("WARN", reason.value)
+    assert "exception" not in line
+
+
+SENTINEL = "BODY-SENTINEL-7731"
+
+
+async def _validate_as_lifecycle_event(inbound: InboundMessage) -> None:
+    CertificateLifecycleEvent.model_validate(inbound.body)
+
+
+def test_the_validation_error_text_quotes_the_sentinel_so_the_leak_test_is_not_vacuous():
+    with pytest.raises(ValidationError) as caught:
+        CertificateLifecycleEvent.model_validate({"event_id": "evt-sentinel", "certificate_id": [SENTINEL]})
+
+    assert SENTINEL in str(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        f'{{"event_id": "evt-sentinel", "note": "{SENTINEL}"'.encode(),
+        json.dumps({"event_id": "evt-sentinel", "certificate_id": [SENTINEL]}).encode(),
+    ],
+    ids=["undecodable", "fails-validation"],
+)
+async def test_invalid_dead_letter_line_never_contains_the_body(client, json_log, body):
+    message = _incoming(body=body, routing_key="cert.created")
+    _wire_delivery(client, message)
+
+    await client.consume(_validate_as_lifecycle_event)
+
+    (line,) = _dead_letter_lines(json_log)
+    assert (line["level"], line["reason"]) == ("WARN", "INVALID")
+    assert "exception" not in line
+    assert SENTINEL not in json.dumps(json_log())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "routing_key", "headers", "handler_error", "expected_failure"),
+    [
+        (
+            b'{"key": "value"}',
+            "cert.created",
+            {},
+            ValueError("retry"),
+            "Failed to handle transport error (RETRY)",
+        ),
+        (
+            b'{"key": "value"}',
+            "cert.created",
+            {HEADER_ATTEMPT: 3},
+            ValueError("exhausted"),
+            "Failed to handle transport error (DEAD_LETTER)",
+        ),
+        (b"\xff\xfe", "cert.created", {}, None, "Failed to dead-letter message"),
+        (
+            b'{"key": "value"}',
+            "cert.unknown",
+            {},
+            UnsupportedOperationError("unsupported routing key: 'cert.unknown'"),
+            "Failed to dead-letter message",
+        ),
+    ],
+    ids=["retry", "exhausted", "invalid", "unsupported"],
+)
+async def test_failed_republish_writes_no_settled_line(
+    client, json_log, body, routing_key, headers, handler_error, expected_failure
+):
+    message = _incoming(body=body, routing_key=routing_key, headers=headers)
+    channel = _wire_delivery(client, message)
+    channel.default_exchange.publish = AsyncMock(side_effect=ConnectionError("broker refused"))
+    failing_dlx = AsyncMock()
+    failing_dlx.publish = AsyncMock(side_effect=ConnectionError("broker refused"))
+    channel.get_exchange = AsyncMock(return_value=failing_dlx)
+
+    await client.consume(AsyncMock(side_effect=handler_error))
+
+    messages = [entry["message"] for entry in json_log()]
+    assert expected_failure in messages
+    assert "Message dead-lettered" not in messages
+    assert not any(text.startswith("Transport retry scheduled") for text in messages)
+    message.nack.assert_awaited_once_with(requeue=True)
+    message.ack.assert_not_called()
