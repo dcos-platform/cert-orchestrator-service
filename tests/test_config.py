@@ -233,3 +233,38 @@ class TestRabbitMQClient:
         custom_settings = Settings(rabbitmq_host="custom.host", rabbitmq_port=9999)
         client = RabbitMQClient(config=custom_settings)
         assert client.url == custom_settings.resolved_rabbitmq_url
+
+
+class TestOutboxSettings:
+    """Outbox relay settings: their defaults and their CERT_ORCH_* overrides."""
+
+    @pytest.mark.parametrize(
+        ("field", "default"),
+        [
+            ("outbox_poll_interval_seconds", 1.0),
+            ("outbox_batch_size", 50),
+            ("outbox_backoff_base_seconds", 1.0),
+            ("outbox_backoff_max_seconds", 60.0),
+            ("outbox_alert_after_attempts", 5),
+        ],
+    )
+    def test_default_value(self, clean_env, field, default):
+        """Each outbox setting has the documented default and type."""
+        value = getattr(Settings(), field)
+        assert value == default
+        assert type(value) is type(default)
+
+    @pytest.mark.parametrize(
+        ("env_name", "raw", "field", "expected"),
+        [
+            ("CERT_ORCH_OUTBOX_POLL_INTERVAL_SECONDS", "0.25", "outbox_poll_interval_seconds", 0.25),
+            ("CERT_ORCH_OUTBOX_BATCH_SIZE", "7", "outbox_batch_size", 7),
+            ("CERT_ORCH_OUTBOX_BACKOFF_BASE_SECONDS", "2", "outbox_backoff_base_seconds", 2.0),
+            ("CERT_ORCH_OUTBOX_BACKOFF_MAX_SECONDS", "120", "outbox_backoff_max_seconds", 120.0),
+            ("CERT_ORCH_OUTBOX_ALERT_AFTER_ATTEMPTS", "3", "outbox_alert_after_attempts", 3),
+        ],
+    )
+    def test_each_value_is_overridable_from_its_environment_variable(self, clean_env, env_name, raw, field, expected):
+        """Each outbox setting is read from its CERT_ORCH_* variable."""
+        clean_env.setenv(env_name, raw)
+        assert getattr(Settings(), field) == expected

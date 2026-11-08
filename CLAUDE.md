@@ -69,5 +69,6 @@ These deviations from cert-api's rules are recorded here per integration gate Ch
 
 1. **Environment variable naming:** Variables carry the `CERT_ORCH_` prefix (e.g., `CERT_ORCH_POSTGRES_HOST`), unlike cert-api's unprefixed names. Reason: an unprefixed `POSTGRES_DB` shared with dcos-infra's `.env` (value `dcos`) would silently point this service at the wrong database.
 2. **Rules file name:** This file is `CLAUDE.md` (uppercase), not cert-api's `claude.md`. Reason: Claude Code on Linux (used in CI) is case-sensitive.
+3. **Outbox relay retries publishes indefinitely with capped backoff and an ERROR alert, where cert-api marks a row `FAILED` after 3 attempts.** Reason: a completion that is given up on is the loss the outbox exists to prevent; the orchestrator's publish failures are broker unavailability, not bad content (bodies are serialised at write time).
 
 The 95% branch coverage bar is not a deviation; it is the platform convention as of 2026-10-04 per `PLATFORM_INTEGRATION_GATE.md` Check 2.

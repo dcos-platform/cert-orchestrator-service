@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     max_retries: int = 3
     max_delivery_attempts: int = 3
     backoff_seconds: int = 5
+    outbox_poll_interval_seconds: float = 1.0
+    outbox_batch_size: int = 50
+    outbox_backoff_base_seconds: float = 1.0
+    outbox_backoff_max_seconds: float = 60.0
+    outbox_alert_after_attempts: int = 5
 
     model_config = SettingsConfigDict(env_prefix="CERT_ORCH_", extra="ignore")
 

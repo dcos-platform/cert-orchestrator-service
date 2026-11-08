@@ -3,13 +3,19 @@ import re
 import pytest
 
 from cert_orchestrator.messaging.inbound import (
+    HEADER_ATTEMPT,
+    HEADER_CORRELATION_ID,
     HEADER_ORIGINAL_EXCHANGE,
     HEADER_ORIGINAL_ROUTING_KEY,
     HEADER_ROOT_EVENT_ID,
+    HEADER_X_DEATH,
+    TRANSPORT_HEADERS,
     DeadLetterReason,
     InboundMessage,
     TransportAction,
     UnsupportedOperationError,
+    business_retry_headers,
+    completion_correlation_id,
     effective_exchange,
     effective_routing_key,
     next_transport_action,
@@ -110,3 +116,74 @@ def test_dead_letter_reason_enum():
 
 def test_root_event_header_name():
     assert HEADER_ROOT_EVENT_ID == "x-cert-orch-root-event-id"
+
+
+VALID_36 = "a" * 36
+
+
+@pytest.mark.parametrize("inbound", ["corr-1", " padded id ", VALID_36])
+def test_completion_correlation_returns_a_valid_inbound_header_unchanged(inbound):
+    assert completion_correlation_id({HEADER_CORRELATION_ID: inbound}, "root-1") == inbound
+
+
+@pytest.mark.parametrize("inbound", [None, "", "   ", "a" * 37, b"corr", 42])
+def test_completion_correlation_falls_back_to_a_valid_root_when_the_header_is_unusable(inbound):
+    assert completion_correlation_id({HEADER_CORRELATION_ID: inbound}, "root-1") == "root-1"
+
+
+def test_completion_correlation_falls_back_to_root_when_the_header_is_absent():
+    assert completion_correlation_id({}, "root-1") == "root-1"
+
+
+def test_completion_correlation_counts_utf16_units_not_code_points():
+    astral = "\U0001f600"
+    thirty_five_ascii_plus_astral = "a" * 35 + astral
+    thirty_four_ascii_plus_astral = "a" * 34 + astral
+
+    assert len(thirty_five_ascii_plus_astral) == 36
+    assert completion_correlation_id({HEADER_CORRELATION_ID: thirty_five_ascii_plus_astral}, "root-1") == "root-1"
+    assert completion_correlation_id({HEADER_CORRELATION_ID: thirty_four_ascii_plus_astral}, "root-1") == (
+        thirty_four_ascii_plus_astral
+    )
+
+
+def test_completion_correlation_is_none_when_neither_header_nor_root_is_valid():
+    assert completion_correlation_id({HEADER_CORRELATION_ID: ""}, "r" * 37) is None
+    assert completion_correlation_id({}, "") is None
+
+
+def test_business_retry_headers_strip_attempt_and_death_and_keep_other_headers():
+    headers = {HEADER_ATTEMPT: 3, HEADER_X_DEATH: [{"reason": "expired"}], "x-correlation-id": "keep-me"}
+
+    result = business_retry_headers(headers, "cert.created", "cert.events")
+
+    assert HEADER_ATTEMPT not in result
+    assert HEADER_X_DEATH not in result
+    assert result["x-correlation-id"] == "keep-me"
+
+
+def test_business_retry_headers_set_original_routing_key_and_exchange_when_absent():
+    result = business_retry_headers({}, "cert.renewed", "cert.events")
+
+    assert result == {HEADER_ORIGINAL_ROUTING_KEY: "cert.renewed", HEADER_ORIGINAL_EXCHANGE: "cert.events"}
+
+
+def test_business_retry_headers_keep_existing_original_routing_key_and_exchange():
+    headers = {HEADER_ORIGINAL_ROUTING_KEY: "first.routing", HEADER_ORIGINAL_EXCHANGE: "first.exchange"}
+
+    result = business_retry_headers(headers, "new.routing", "new.exchange")
+
+    assert result[HEADER_ORIGINAL_ROUTING_KEY] == "first.routing"
+    assert result[HEADER_ORIGINAL_EXCHANGE] == "first.exchange"
+
+
+def test_business_retry_headers_do_not_mutate_the_input():
+    headers = {HEADER_ATTEMPT: 2, "x-keep": "v"}
+
+    business_retry_headers(headers, "cert.created", "cert.events")
+
+    assert headers == {HEADER_ATTEMPT: 2, "x-keep": "v"}
+
+
+def test_transport_headers_are_the_attempt_and_death_headers():
+    assert TRANSPORT_HEADERS == (HEADER_ATTEMPT, HEADER_X_DEATH)
