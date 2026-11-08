@@ -12,4 +12,5 @@ class EventPublisher(Protocol):
         delay_seconds: int,
         routing_key: str,
         headers: Mapping[str, Any],
+        exchange: str,
     ) -> None: ...

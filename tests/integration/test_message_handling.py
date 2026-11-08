@@ -8,8 +8,11 @@ import uuid
 import aio_pika
 import pytest
 import pytest_asyncio
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from cert_orchestrator.config import Settings
+from cert_orchestrator.messaging.handlers import LifecycleMessageHandler
 from cert_orchestrator.messaging.inbound import (
     HEADER_DEAD_LETTER_REASON,
     HEADER_EXCEPTION_MESSAGE,
@@ -18,6 +21,7 @@ from cert_orchestrator.messaging.inbound import (
     InboundMessage,
 )
 from cert_orchestrator.messaging.rabbitmq import RabbitMQClient
+from cert_orchestrator.models import Base, CertificateLifecycle, LifecycleOperation, LifecycleState
 
 
 @pytest.fixture
@@ -189,7 +193,11 @@ async def test_business_retry_preserves_routing_key_and_headers(client_with_clea
 
     start = time.monotonic()
     await client.publish_retry(
-        payload, delay_seconds=integration_settings.backoff_seconds, routing_key="custom.routing", headers=test_headers
+        payload,
+        delay_seconds=integration_settings.backoff_seconds,
+        routing_key="custom.routing",
+        headers=test_headers,
+        exchange="test.exchange",
     )
 
     incoming = await client.channel.get_queue(integration_settings.incoming_queue)
@@ -215,13 +223,103 @@ async def test_business_retry_preserves_routing_key_and_headers(client_with_clea
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_shared_queue_arguments_empty(client_with_cleanup, integration_settings):
-    """Shared queues have no arguments."""
+async def test_shared_queue_declarations_match_server_arguments(client_with_cleanup, integration_settings):
+    """Server-side proof: shared queues redeclare with no arguments, and a conflicting declaration is refused."""
+    connection = await aio_pika.connect(client_with_cleanup.url)
+    try:
+        channel = await connection.channel()
+        await channel.declare_queue(integration_settings.incoming_queue, durable=True)
+        await channel.declare_queue(integration_settings.completion_queue, durable=True)
+
+        with pytest.raises(aio_pika.exceptions.ChannelPreconditionFailed):
+            await channel.declare_queue(
+                integration_settings.incoming_queue,
+                durable=True,
+                arguments={"x-message-ttl": 1},
+            )
+    finally:
+        await connection.close()
+
+
+def _integration_session() -> Session:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def _lifecycle_message(event_id: str, certificate_id: str, should_fail: bool = False) -> aio_pika.Message:
+    body = {"event_id": event_id, "certificate_id": certificate_id, "payload": {"should_fail": should_fail}}
+    return aio_pika.Message(
+        body=json.dumps(body).encode("utf-8"),
+        content_type="application/json",
+        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+    )
+
+
+async def _get_message_within(queue, seconds: float):
+    """Return the next message from the queue within the time limit, or None."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        message = await queue.get(fail=False)
+        if message is not None:
+            return message
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def _wait_for_state(session: Session, certificate_id: str, state: LifecycleState, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        row = session.query(CertificateLifecycle).filter_by(certificate_id=certificate_id).one_or_none()
+        if row is not None and row.state == state:
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_revoke_gets_no_completion_and_create_does(client_with_cleanup, integration_settings, monkeypatch):
+    """Revoke is recorded without a completion on the real broker; create on the same setup still completes."""
     client = client_with_cleanup
     channel = client.channel
+    session = _integration_session()
 
-    incoming_queue_obj = await channel.get_queue(integration_settings.incoming_queue)
-    completion_queue_obj = await channel.get_queue(integration_settings.completion_queue)
+    @contextlib.contextmanager
+    def _session_provider():
+        yield session
 
-    assert incoming_queue_obj.arguments in (None, {})
-    assert completion_queue_obj.arguments in (None, {})
+    monkeypatch.setattr("cert_orchestrator.messaging.handlers.get_session", _session_provider)
+
+    exchange = await channel.declare_exchange(
+        f"test.topic.{uuid.uuid4().hex[:8]}",
+        aio_pika.ExchangeType.TOPIC,
+        durable=False,
+        auto_delete=False,
+    )
+    incoming = await channel.get_queue(integration_settings.incoming_queue)
+    completions = await channel.get_queue(integration_settings.completion_queue)
+    consume_task = asyncio.create_task(client.consume(LifecycleMessageHandler(client).handle))
+    try:
+        await incoming.bind(exchange, routing_key="cert.#")
+        await asyncio.sleep(0.1)
+
+        revoke = _lifecycle_message("evt-int-rev", "cert-int-rev", should_fail=True)
+        await exchange.publish(revoke, routing_key="cert.revoked")
+        assert await _wait_for_state(session, "cert-int-rev", LifecycleState.COMPLETED, 5.0)
+        assert await _get_message_within(completions, 2.0) is None
+
+        create = _lifecycle_message("evt-int-create", "cert-int-create")
+        await exchange.publish(create, routing_key="cert.created")
+        completion = await _get_message_within(completions, 5.0)
+        assert completion is not None
+        assert json.loads(completion.body)["status"] == "COMPLETED"
+        await completion.ack()
+
+        revoked = session.query(CertificateLifecycle).filter_by(certificate_id="cert-int-rev").one()
+        assert revoked.operation == LifecycleOperation.REVOKE
+    finally:
+        consume_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consume_task
+        await exchange.delete()

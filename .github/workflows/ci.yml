@@ -88,6 +88,7 @@ jobs:
           alembic upgrade head
           alembic downgrade base
           alembic upgrade head
+          alembic check
 
       - name: SonarCloud scan
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'

@@ -14,9 +14,12 @@ from cert_orchestrator.messaging.inbound import (
     HEADER_EXCEPTION_MESSAGE,
     HEADER_ORIGINAL_EXCHANGE,
     HEADER_ORIGINAL_ROUTING_KEY,
+    HEADER_X_DEATH,
     DeadLetterReason,
     InboundMessage,
     TransportAction,
+    UnsupportedOperationError,
+    effective_exchange,
     effective_routing_key,
     next_transport_action,
     wait_queue_name,
@@ -24,6 +27,9 @@ from cert_orchestrator.messaging.inbound import (
 from cert_orchestrator.schemas import CompletionEvent
 
 logger = logging.getLogger(__name__)
+
+# Delivery-transport headers that a business retry must not carry: it is a new event with a fresh budget.
+TRANSPORT_HEADERS = (HEADER_ATTEMPT, HEADER_X_DEATH)
 
 
 class RabbitMQClient:
@@ -76,17 +82,40 @@ class RabbitMQClient:
             body=payload,
             routing_key=effective_routing_key(message.routing_key or "", message.headers),
             headers=message.headers,
+            exchange=effective_exchange(message.exchange or "", message.headers),
         )
 
         try:
             await self._message_handler(inbound)
-            await message.ack()
-        except ValidationError:
-            if await self._dead_letter_or_nack(message, DeadLetterReason.INVALID, original_body=message.body):
-                await message.ack()
         except Exception as e:
-            if await self._handle_transport_error(message, inbound, e):
-                await message.ack()
+            await self._handle_handler_error(message, inbound, e)
+        else:
+            # Outside the handler try: an ack failure after a successful handler is not a handler failure.
+            await message.ack()
+
+    async def _handle_handler_error(
+        self,
+        message: AbstractIncomingMessage,
+        inbound: InboundMessage,
+        exception: Exception,
+    ) -> None:
+        """Dead-letter or transport-retry a message whose handler raised, then ack it once settled."""
+        if isinstance(exception, UnsupportedOperationError):
+            settled = await self._dead_letter_or_nack(
+                message,
+                DeadLetterReason.UNSUPPORTED_OPERATION,
+                original_body=message.body,
+            )
+        elif isinstance(exception, ValidationError):
+            settled = await self._dead_letter_or_nack(
+                message,
+                DeadLetterReason.INVALID,
+                original_body=message.body,
+            )
+        else:
+            settled = await self._handle_transport_error(message, inbound, exception)
+        if settled:
+            await message.ack()
 
     async def _dead_letter_or_nack(
         self,
@@ -199,6 +228,8 @@ class RabbitMQClient:
             content_type=message.content_type,
             headers=headers,
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            message_id=message.message_id,
+            correlation_id=message.correlation_id,
         )
 
         await self.channel.default_exchange.publish(message_obj, routing_key=queue_name)
@@ -216,7 +247,12 @@ class RabbitMQClient:
         await self.channel.default_exchange.publish(message, routing_key=self.config.completion_queue)
 
     async def publish_retry(
-        self, payload: dict, delay_seconds: int, routing_key: str, headers: Mapping[str, Any]
+        self,
+        payload: dict,
+        delay_seconds: int,
+        routing_key: str,
+        headers: Mapping[str, Any],
+        exchange: str,
     ) -> None:
         """Publish a business retry via a wait queue with TTL-based delay."""
         if not self.channel:
@@ -225,10 +261,12 @@ class RabbitMQClient:
         queue_name = await self._ensure_wait_queue(delay_seconds)
 
         msg_headers = dict(headers) if headers else {}
+        for name in TRANSPORT_HEADERS:
+            msg_headers.pop(name, None)
         if HEADER_ORIGINAL_ROUTING_KEY not in msg_headers:
             msg_headers[HEADER_ORIGINAL_ROUTING_KEY] = routing_key
         if HEADER_ORIGINAL_EXCHANGE not in msg_headers:
-            msg_headers[HEADER_ORIGINAL_EXCHANGE] = ""
+            msg_headers[HEADER_ORIGINAL_EXCHANGE] = exchange
 
         message = aio_pika.Message(
             body=json.dumps(payload).encode("utf-8"),

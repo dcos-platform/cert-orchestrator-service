@@ -5,10 +5,14 @@ import pytest
 from cert_orchestrator.config import Settings
 from cert_orchestrator.messaging.inbound import (
     HEADER_ATTEMPT,
+    HEADER_DEAD_LETTER_REASON,
     HEADER_EXCEPTION_MESSAGE,
     HEADER_ORIGINAL_EXCHANGE,
     HEADER_ORIGINAL_ROUTING_KEY,
+    HEADER_X_DEATH,
     DeadLetterReason,
+    InboundMessage,
+    UnsupportedOperationError,
 )
 from cert_orchestrator.messaging.rabbitmq import RabbitMQClient
 from cert_orchestrator.schemas import CompletionEvent
@@ -419,7 +423,9 @@ async def test_publish_retry_uses_wait_queue(client):
 
     client.channel.default_exchange.publish = capture_publish
 
-    await client.publish_retry({"test": "payload"}, delay_seconds=5, routing_key="test.key", headers={})
+    await client.publish_retry(
+        {"test": "payload"}, delay_seconds=5, routing_key="test.key", headers={}, exchange="test.exchange"
+    )
 
     assert len(published) == 1
     assert published[0] == "test.wait.5000ms"
@@ -440,7 +446,9 @@ async def test_publish_retry_preserves_headers(client):
     client.channel.default_exchange.publish = capture_publish
 
     headers = {"x-correlation-id": "test-123"}
-    await client.publish_retry({"test": "payload"}, delay_seconds=5, routing_key="test.key", headers=headers)
+    await client.publish_retry(
+        {"test": "payload"}, delay_seconds=5, routing_key="test.key", headers=headers, exchange="test.exchange"
+    )
 
     assert len(published) == 1
     msg_headers = published[0]
@@ -461,7 +469,9 @@ async def test_wait_queue_has_dead_letter_routing_key(client):
     client.channel.default_exchange = AsyncMock()
     client.channel.default_exchange.publish = AsyncMock()
 
-    await client.publish_retry({"test": "payload"}, delay_seconds=5, routing_key="test.key", headers={})
+    await client.publish_retry(
+        {"test": "payload"}, delay_seconds=5, routing_key="test.key", headers={}, exchange="test.exchange"
+    )
 
     assert len(declare_calls) == 1
     name, arguments = declare_calls[0]
@@ -661,7 +671,9 @@ async def test_publish_retry_without_channel():
     client.channel = None
 
     with pytest.raises(RuntimeError, match="RabbitMQ channel is not initialized"):
-        await client.publish_retry({"test": "payload"}, delay_seconds=5, routing_key="test.key", headers={})
+        await client.publish_retry(
+            {"test": "payload"}, delay_seconds=5, routing_key="test.key", headers={}, exchange="test.exchange"
+        )
 
 
 @pytest.mark.asyncio
@@ -807,7 +819,13 @@ async def test_publish_retry_header_already_set_original_routing_key(client):
     client.channel.default_exchange.publish = capture_publish
 
     headers = {HEADER_ORIGINAL_ROUTING_KEY: "first.routing"}
-    await client.publish_retry({"test": "payload"}, delay_seconds=5, routing_key="new.routing", headers=headers)
+    await client.publish_retry(
+        {"test": "payload"},
+        delay_seconds=5,
+        routing_key="new.routing",
+        headers=headers,
+        exchange="test.exchange",
+    )
 
     assert len(published) == 1
     msg_headers = published[0]
@@ -829,8 +847,180 @@ async def test_publish_retry_header_already_set_original_exchange(client):
     client.channel.default_exchange.publish = capture_publish
 
     headers = {HEADER_ORIGINAL_EXCHANGE: "first.exchange"}
-    await client.publish_retry({"test": "payload"}, delay_seconds=5, routing_key="test.key", headers=headers)
+    await client.publish_retry(
+        {"test": "payload"}, delay_seconds=5, routing_key="test.key", headers=headers, exchange="test.exchange"
+    )
 
     assert len(published) == 1
     msg_headers = published[0]
     assert msg_headers[HEADER_ORIGINAL_EXCHANGE] == "first.exchange"
+
+
+def _wire_consume(client: RabbitMQClient, message: MagicMock) -> AsyncMock:
+    """Give the client a channel whose queue delivers the given message to the consume callback."""
+    client.channel = AsyncMock()
+    queue = AsyncMock()
+
+    async def fake_consume(cb):
+        await cb(message)
+
+    queue.consume.side_effect = fake_consume
+    client.channel.declare_queue.return_value = queue
+    return client.channel
+
+
+def _incoming(
+    body: bytes = b'{"key": "value"}',
+    routing_key: str = "cert.created",
+    headers: dict | None = None,
+    exchange: str | None = "test.exchange",
+) -> MagicMock:
+    message = MagicMock()
+    message.body = body
+    message.routing_key = routing_key
+    message.headers = headers if headers is not None else {}
+    message.exchange = exchange
+    message.message_id = None
+    message.correlation_id = None
+    message.content_type = "application/json"
+    message.ack = AsyncMock()
+    message.nack = AsyncMock()
+    return message
+
+
+def _capture_default_exchange(client: RabbitMQClient) -> list:
+    """Give the client a channel whose default exchange records each (message, routing_key) published."""
+    client.channel = AsyncMock()
+    client.channel.declare_queue = AsyncMock(return_value=AsyncMock())
+    client.channel.default_exchange = AsyncMock()
+    published: list = []
+
+    async def capture_publish(msg, routing_key):
+        published.append((msg, routing_key))
+
+    client.channel.default_exchange.publish = capture_publish
+    return published
+
+
+@pytest.mark.asyncio
+async def test_unsupported_operation_is_dead_lettered_with_its_reason_and_acked(client):
+    message = _incoming(routing_key="cert.unknown")
+    channel = _wire_consume(client, message)
+    dlx = AsyncMock()
+    channel.get_exchange = AsyncMock(return_value=dlx)
+    published = []
+
+    async def capture_publish(msg, routing_key):
+        published.append(msg)
+
+    dlx.publish = capture_publish
+    handler = AsyncMock(side_effect=UnsupportedOperationError("unsupported routing key: 'cert.unknown'"))
+
+    await client.consume(handler)
+
+    assert len(published) == 1
+    assert published[0].headers[HEADER_DEAD_LETTER_REASON] == "UNSUPPORTED_OPERATION"
+    assert published[0].body == b'{"key": "value"}'
+    message.ack.assert_awaited_once()
+    message.nack.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_operation_dead_letter_failure_nacks_for_redelivery(client):
+    message = _incoming(routing_key="cert.unknown")
+    _wire_consume(client, message)
+    handler = AsyncMock(side_effect=UnsupportedOperationError("unsupported routing key: 'cert.unknown'"))
+
+    with patch.object(client, "_dead_letter", side_effect=RuntimeError("broker error")):
+        await client.consume(handler)
+
+    message.nack.assert_awaited_once_with(requeue=True)
+    message.ack.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ack_failure_after_successful_handler_propagates_without_retry_or_dead_letter(client):
+    message = _incoming()
+    message.ack = AsyncMock(side_effect=RuntimeError("ack failed"))
+    channel = _wire_consume(client, message)
+    handler = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="ack failed"):
+        await client.consume(handler)
+
+    handler.assert_awaited_once()
+    channel.get_exchange.assert_not_called()
+    channel.default_exchange.publish.assert_not_called()
+    message.nack.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_inbound_exchange_is_empty_string_when_message_has_no_exchange(client):
+    message = _incoming(exchange=None)
+    _wire_consume(client, message)
+    handler = AsyncMock()
+
+    await client.consume(handler)
+
+    assert handler.call_args.args[0].exchange == ""
+
+
+@pytest.mark.asyncio
+async def test_inbound_exchange_prefers_original_exchange_header(client):
+    message = _incoming(headers={HEADER_ORIGINAL_EXCHANGE: "first.exchange"}, exchange="second.exchange")
+    _wire_consume(client, message)
+    handler = AsyncMock()
+
+    await client.consume(handler)
+
+    assert handler.call_args.args[0].exchange == "first.exchange"
+
+
+@pytest.mark.asyncio
+async def test_publish_retry_strips_attempt_and_death_headers_and_keeps_others(client):
+    published = _capture_default_exchange(client)
+    headers = {HEADER_ATTEMPT: 3, HEADER_X_DEATH: [{"reason": "expired"}], "x-correlation-id": "keep-me"}
+
+    await client.publish_retry(
+        {"test": "payload"},
+        delay_seconds=5,
+        routing_key="cert.created",
+        headers=headers,
+        exchange="test.exchange",
+    )
+
+    msg_headers = published[0][0].headers
+    assert HEADER_ATTEMPT not in msg_headers
+    assert HEADER_X_DEATH not in msg_headers
+    assert msg_headers["x-correlation-id"] == "keep-me"
+    assert HEADER_ATTEMPT in headers
+
+
+@pytest.mark.asyncio
+async def test_transport_retry_keeps_original_message_id_and_correlation_id(client):
+    published = _capture_default_exchange(client)
+    message = _incoming()
+    message.message_id = "msg-original"
+    message.correlation_id = "corr-original"
+    inbound = InboundMessage(body={"key": "value"}, routing_key="cert.created", headers={}, exchange="test.exchange")
+
+    await client._schedule_transport_retry(message, inbound, 1)
+
+    published_message = published[0][0]
+    assert published_message.message_id == "msg-original"
+    assert published_message.correlation_id == "corr-original"
+
+
+@pytest.mark.asyncio
+async def test_publish_retry_sets_original_exchange_from_argument_when_absent(client):
+    published = _capture_default_exchange(client)
+
+    await client.publish_retry(
+        {"test": "payload"},
+        delay_seconds=5,
+        routing_key="cert.created",
+        headers={},
+        exchange="cert.events",
+    )
+
+    assert published[0][0].headers[HEADER_ORIGINAL_EXCHANGE] == "cert.events"
