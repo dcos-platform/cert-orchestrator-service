@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from cert_orchestrator.models import LifecycleState
+from cert_orchestrator.models import LifecycleOperation, LifecycleState
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,12 @@ def decide_transition(*, success: bool, retry_count: int, max_retries: int) -> T
 
     should_retry = retry_count < max_retries
     return TransitionDecision(
-        next_state=LifecycleState.FAILED,
+        next_state=LifecycleState.PROCESSING if should_retry else LifecycleState.FAILED,
         should_retry=should_retry,
         should_publish_completion=not should_retry,
     )
+
+
+def completion_required(operation: LifecycleOperation) -> bool:
+    """Return True when the operation is orchestrated and publishes a completion."""
+    return operation in (LifecycleOperation.CREATE, LifecycleOperation.RENEW)

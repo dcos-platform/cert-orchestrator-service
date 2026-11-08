@@ -23,7 +23,7 @@ Changes that require an update to `context.md`:
 
 **Business logic:** All business logic must be unit-tested.
 
-**Test coverage:** ≥ 95% branch coverage on new code (`pytest --cov` with `branch = true` in `pyproject.toml`). Enforced in CI by `diff-cover` at 95% of changed lines on every pull request, and by `fail_under` in `pyproject.toml` on the whole codebase. `fail_under` only ever rises: each story sets it to its measured total, rounded down, until 95.
+**Test coverage:** The bar is ≥ 95% **combined** coverage: coverage.py's total with `branch = true` in `pyproject.toml`, which counts lines and branches together — the same basis as SonarCloud's "Coverage". On new code, CI enforces ≥ 95% of changed lines with `diff-cover` on every pull request. On the whole codebase, CI enforces `fail_under` in `pyproject.toml`, which only ever rises: each story sets it to its measured combined total, rounded down, until 95. Every story's evidence also quotes **branch-only** coverage (`covered_branches / num_branches` from `coverage json`) so it cannot hide.
 
 **Lint:** ruff, configuration in `pyproject.toml`; `ruff check .` and `ruff format --check .` must pass. `# noqa` needs the rule code and a reason on the same line.
 

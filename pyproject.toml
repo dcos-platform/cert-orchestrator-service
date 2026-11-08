@@ -42,7 +42,7 @@ source = ["cert_orchestrator"]
 relative_files = true
 
 [tool.coverage.report]
-fail_under = 93
+fail_under = 94
 precision = 2
 show_missing = true
 exclude_also = ["^\\s*\\.\\.\\.$"]
@@ -53,4 +53,4 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]
-ignore = ["UP042"]  # Converting LifecycleState to StrEnum changes str() of members, which reaches logs and the database enum; revisit in Story 4.
+ignore = ["UP042"]  # Converting LifecycleState and LifecycleOperation to StrEnum changes str() of members, which reaches logs and the database enums; deferred, not in Story 4.

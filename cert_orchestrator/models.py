@@ -17,11 +17,23 @@ class LifecycleState(str, Enum):
     FAILED = "FAILED"
 
 
+class LifecycleOperation(str, Enum):
+    """Cert-api operation that a lifecycle record belongs to."""
+
+    CREATE = "CREATE"
+    RENEW = "RENEW"
+    REVOKE = "REVOKE"
+    EXPIRE = "EXPIRE"
+
+
 class CertificateLifecycle(Base):
     __tablename__ = "certificate_lifecycles"
+    __table_args__ = (UniqueConstraint("root_event_id", name="uq_certificate_lifecycles_root_event_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    certificate_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    certificate_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    operation: Mapped[LifecycleOperation | None] = mapped_column(SqlEnum(LifecycleOperation), nullable=True)
+    root_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     state: Mapped[LifecycleState] = mapped_column(
         SqlEnum(LifecycleState), nullable=False, default=LifecycleState.PENDING
     )

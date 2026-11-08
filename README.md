@@ -6,7 +6,7 @@ FastAPI based orchestrator that consumes certificate lifecycle events, runs a st
 
 - `cert_orchestrator/main.py`: FastAPI app and lifecycle management.
 - `cert_orchestrator/messaging/handlers.py`: RabbitMQ message handler and orchestration flow.
-- `cert_orchestrator/state_machine.py`: transition decisions (`PENDING -> PROCESSING -> COMPLETED/FAILED`) and retry behavior.
+- `cert_orchestrator/state_machine.py`: transition decisions (`PROCESSING` while a retry is scheduled, `COMPLETED`, `FAILED` once retries are exhausted) and which operations publish a completion.
 - `cert_orchestrator/persistence/repository.py`: SQLAlchemy persistence and idempotency guard (`processed_events`).
 - `alembic/`: schema migrations for PostgreSQL lifecycle tables.
 
@@ -42,6 +42,8 @@ uvicorn cert_orchestrator.main:app --reload
 
 Retry message delays are implemented using broker-native wait queues with TTL and dead-lettering to avoid message loss. A dead-letter queue (`cert.orchestrator.dlq`) collects messages that cannot be decoded, validated, or retried.
 
+Operation handling: each cert-api routing key maps to an operation with its own lifecycle record. `cert.created` and `cert.renewed` are orchestrated and publish a completion, with retries and a `FAILED` completion once retries are exhausted. `cert.revoked` and `cert.expired` are recorded and acknowledged with no completion and no retry. Any other `cert.*` key is dead-lettered with reason `UNSUPPORTED_OPERATION`.
+
 ## Test
 
 Run tests with broker (via Docker on `dcos-net`):
@@ -68,7 +70,7 @@ Every pull request and push to `main` runs:
 
 - Lint check (`ruff`)
 - Format check (`ruff`)
-- Test suite with branch coverage (floor: 93%)
+- Test suite with combined line and branch coverage (floor: 94%; branch-only is also reported)
 - New-code coverage gate (95% of changed lines, PRs only)
-- Migration round trip (upgrade, downgrade, upgrade)
+- Migration round trip (upgrade, downgrade, upgrade) and `alembic check` (models match migrations)
 - SonarCloud analysis with quality gate wait
