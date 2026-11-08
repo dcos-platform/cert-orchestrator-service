@@ -4,11 +4,13 @@ FastAPI based orchestrator that consumes certificate lifecycle events, runs a st
 
 ## Components
 
-- `cert_orchestrator/main.py`: FastAPI app and lifecycle management.
-- `cert_orchestrator/messaging/handlers.py`: RabbitMQ message handler and orchestration flow.
+- `cert_orchestrator/main.py`: FastAPI app, lifespan management, and the outbox relay task.
+- `cert_orchestrator/messaging/handlers.py`: RabbitMQ message handler and orchestration flow (writes outbox rows; never touches the broker).
+- `cert_orchestrator/messaging/relay.py`: outbox relay that publishes pending rows with broker confirms and retries failures with capped backoff.
 - `cert_orchestrator/state_machine.py`: transition decisions (`PROCESSING` while a retry is scheduled, `COMPLETED`, `FAILED` once retries are exhausted) and which operations publish a completion.
 - `cert_orchestrator/persistence/repository.py`: SQLAlchemy persistence and idempotency guard (`processed_events`).
-- `alembic/`: schema migrations for PostgreSQL lifecycle tables.
+- `cert_orchestrator/persistence/outbox.py`: outbox persistence (`outbox_messages`): enqueue, claim, and mark.
+- `alembic/`: schema migrations for PostgreSQL lifecycle and outbox tables.
 
 ## Run locally
 
@@ -44,7 +46,11 @@ Retry message delays are implemented using broker-native wait queues with TTL an
 
 Operation handling: each cert-api routing key maps to an operation with its own lifecycle record. `cert.created` and `cert.renewed` are orchestrated and publish a completion, with retries and a `FAILED` completion once retries are exhausted. `cert.revoked` and `cert.expired` are recorded and acknowledged with no completion and no retry. Any other `cert.*` key is dead-lettered with reason `UNSUPPORTED_OPERATION`.
 
+Outbox: the handler writes each completion and business retry to the `outbox_messages` table in the same database transaction as the lifecycle change, and never publishes from the handler itself. A relay task started with the application publishes pending rows, and marks a row sent only after the broker confirms it. A failed publish is retried with capped exponential backoff and is never abandoned; an ERROR log is written when a row has failed `CERT_ORCH_OUTBOX_ALERT_AFTER_ATTEMPTS` times. Completions carry `message_id` set to the event id and, when a valid one is available, an `x-correlation-id` header.
+
 ## Test
+
+Integration tests need RabbitMQ **and** a PostgreSQL database migrated with `alembic upgrade head` (`CERT_ORCH_POSTGRES_*`). They fail, rather than skip, when either is unreachable.
 
 Run tests with broker (via Docker on `dcos-net`):
 
@@ -70,7 +76,7 @@ Every pull request and push to `main` runs:
 
 - Lint check (`ruff`)
 - Format check (`ruff`)
-- Test suite with combined line and branch coverage (floor: 94%; branch-only is also reported)
+- Migration round trip (upgrade, downgrade, upgrade) and `alembic check` (models match migrations), before the tests so that the integration tests run against the migrated schema
+- Test suite with combined line and branch coverage (floor: 95%; branch-only is also reported)
 - New-code coverage gate (95% of changed lines, PRs only)
-- Migration round trip (upgrade, downgrade, upgrade) and `alembic check` (models match migrations)
 - SonarCloud analysis with quality gate wait

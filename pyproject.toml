@@ -34,7 +34,7 @@ include = ["cert_orchestrator*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
-markers = ["integration: needs a running RabbitMQ"]
+markers = ["integration: needs a running RabbitMQ and a PostgreSQL database migrated with alembic"]
 
 [tool.coverage.run]
 branch = true
@@ -42,7 +42,7 @@ source = ["cert_orchestrator"]
 relative_files = true
 
 [tool.coverage.report]
-fail_under = 94
+fail_under = 95
 precision = 2
 show_missing = true
 exclude_also = ["^\\s*\\.\\.\\.$"]

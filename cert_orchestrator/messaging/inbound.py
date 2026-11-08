@@ -12,6 +12,13 @@ HEADER_ATTEMPT = "x-cert-orch-attempt"
 HEADER_DEAD_LETTER_REASON = "x-cert-orch-dead-letter-reason"
 HEADER_ROOT_EVENT_ID = "x-cert-orch-root-event-id"
 HEADER_X_DEATH = "x-death"
+HEADER_CORRELATION_ID = "x-correlation-id"
+# Source: cert-api LoggingContext.isValidCorrelationId. Its length limit counts UTF-16 code units,
+# as Java String.length() does.
+CORRELATION_ID_MAX_LENGTH = 36
+
+# Delivery-transport headers that a business retry must not carry: it is a new event with a fresh budget.
+TRANSPORT_HEADERS = (HEADER_ATTEMPT, HEADER_X_DEATH)
 
 _OPERATION_BY_ROUTING_KEY: dict[str, LifecycleOperation] = {
     "cert.created": LifecycleOperation.CREATE,
@@ -78,3 +85,29 @@ def operation_for_routing_key(routing_key: str) -> LifecycleOperation:
 def wait_queue_name(prefix: str, delay_seconds: int) -> str:
     """Generate wait queue name from prefix and delay."""
     return f"{prefix}.{delay_seconds * 1000}ms"
+
+
+def _is_valid_correlation_id(value: Any) -> bool:
+    """Return True when cert-api would accept the value as a correlation id."""
+    if not isinstance(value, str) or value.strip() == "":
+        return False
+    # Two bytes per UTF-16 code unit; surrogatepass keeps lone surrogates countable as one unit each.
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2 <= CORRELATION_ID_MAX_LENGTH
+
+
+def completion_correlation_id(headers: Mapping[str, Any], root_event_id: str) -> str | None:
+    """Return the inbound correlation id if valid, else the root event id if valid, else None."""
+    inbound = headers.get(HEADER_CORRELATION_ID)
+    if _is_valid_correlation_id(inbound):
+        return inbound
+    if _is_valid_correlation_id(root_event_id):
+        return root_event_id
+    return None
+
+
+def business_retry_headers(headers: Mapping[str, Any], routing_key: str, exchange: str) -> dict[str, Any]:
+    """Return a new header dict for a business retry: transport headers removed, x-original-* set if absent."""
+    result = {name: value for name, value in headers.items() if name not in TRANSPORT_HEADERS}
+    result.setdefault(HEADER_ORIGINAL_ROUTING_KEY, routing_key)
+    result.setdefault(HEADER_ORIGINAL_EXCHANGE, exchange)
+    return result

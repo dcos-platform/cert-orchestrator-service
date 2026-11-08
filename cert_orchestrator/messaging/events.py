@@ -1,16 +1,9 @@
-from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Protocol
 
-from cert_orchestrator.schemas import CompletionEvent
+from cert_orchestrator.models import OutboxMessage
 
 
-class EventPublisher(Protocol):
-    async def publish_completion(self, event: CompletionEvent) -> None: ...
-    async def publish_retry(
-        self,
-        payload: dict,
-        delay_seconds: int,
-        routing_key: str,
-        headers: Mapping[str, Any],
-        exchange: str,
-    ) -> None: ...
+class OutboxPublisher(Protocol):
+    """Broker seam for the outbox relay: publish one stored row, raising if the broker does not confirm it."""
+
+    async def publish_outbox_message(self, row: OutboxMessage) -> None: ...

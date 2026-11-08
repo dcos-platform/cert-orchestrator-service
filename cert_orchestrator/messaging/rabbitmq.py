@@ -1,7 +1,6 @@
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from collections.abc import Awaitable, Callable
 
 import aio_pika
 from aio_pika.abc import AbstractIncomingMessage
@@ -14,7 +13,6 @@ from cert_orchestrator.messaging.inbound import (
     HEADER_EXCEPTION_MESSAGE,
     HEADER_ORIGINAL_EXCHANGE,
     HEADER_ORIGINAL_ROUTING_KEY,
-    HEADER_X_DEATH,
     DeadLetterReason,
     InboundMessage,
     TransportAction,
@@ -24,12 +22,9 @@ from cert_orchestrator.messaging.inbound import (
     next_transport_action,
     wait_queue_name,
 )
-from cert_orchestrator.schemas import CompletionEvent
+from cert_orchestrator.models import OutboxKind, OutboxMessage
 
 logger = logging.getLogger(__name__)
-
-# Delivery-transport headers that a business retry must not carry: it is a new event with a fresh budget.
-TRANSPORT_HEADERS = (HEADER_ATTEMPT, HEADER_X_DEATH)
 
 
 class RabbitMQClient:
@@ -234,45 +229,20 @@ class RabbitMQClient:
 
         await self.channel.default_exchange.publish(message_obj, routing_key=queue_name)
 
-    async def publish_completion(self, event: CompletionEvent) -> None:
-        """Publish a completion event to the completion queue."""
+    async def publish_outbox_message(self, row: OutboxMessage) -> None:
+        """Publish a stored outbox row as written: completions to the completion queue, retries via their wait queue."""
         if not self.channel:
             raise RuntimeError("RabbitMQ channel is not initialized")
 
         message = aio_pika.Message(
-            body=event.model_dump_json().encode("utf-8"),
+            body=row.body.encode("utf-8"),
             content_type="application/json",
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            message_id=row.message_id,
+            headers=row.headers,
         )
-        await self.channel.default_exchange.publish(message, routing_key=self.config.completion_queue)
-
-    async def publish_retry(
-        self,
-        payload: dict,
-        delay_seconds: int,
-        routing_key: str,
-        headers: Mapping[str, Any],
-        exchange: str,
-    ) -> None:
-        """Publish a business retry via a wait queue with TTL-based delay."""
-        if not self.channel:
-            raise RuntimeError("RabbitMQ channel is not initialized")
-
-        queue_name = await self._ensure_wait_queue(delay_seconds)
-
-        msg_headers = dict(headers) if headers else {}
-        for name in TRANSPORT_HEADERS:
-            msg_headers.pop(name, None)
-        if HEADER_ORIGINAL_ROUTING_KEY not in msg_headers:
-            msg_headers[HEADER_ORIGINAL_ROUTING_KEY] = routing_key
-        if HEADER_ORIGINAL_EXCHANGE not in msg_headers:
-            msg_headers[HEADER_ORIGINAL_EXCHANGE] = exchange
-
-        message = aio_pika.Message(
-            body=json.dumps(payload).encode("utf-8"),
-            content_type="application/json",
-            headers=msg_headers,
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-        )
-
-        await self.channel.default_exchange.publish(message, routing_key=queue_name)
+        if row.kind == OutboxKind.COMPLETION:
+            routing_key = self.config.completion_queue
+        else:
+            routing_key = await self._ensure_wait_queue(row.delay_seconds)
+        await self.channel.default_exchange.publish(message, routing_key=routing_key)

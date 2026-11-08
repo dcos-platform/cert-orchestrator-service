@@ -1,7 +1,8 @@
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -24,6 +25,20 @@ class LifecycleOperation(str, Enum):
     RENEW = "RENEW"
     REVOKE = "REVOKE"
     EXPIRE = "EXPIRE"
+
+
+class OutboxKind(str, Enum):
+    """Kind of outbox message: a lifecycle completion or a business retry."""
+
+    COMPLETION = "COMPLETION"
+    RETRY = "RETRY"
+
+
+class OutboxState(str, Enum):
+    """Relay state of an outbox message: waiting to be published, or published and confirmed."""
+
+    PENDING = "PENDING"
+    SENT = "SENT"
 
 
 class CertificateLifecycle(Base):
@@ -56,3 +71,26 @@ class ProcessedEvent(Base):
     event_id: Mapped[str] = mapped_column(String(255), nullable=False)
     certificate_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class OutboxMessage(Base):
+    """A message the handler wrote in its transaction and the relay publishes later."""
+
+    __tablename__ = "outbox_messages"
+    __table_args__ = (
+        UniqueConstraint("kind", "message_id", name="uq_outbox_messages_kind_message_id"),
+        Index("ix_outbox_messages_state_available_at", "state", "available_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    kind: Mapped[OutboxKind] = mapped_column(SqlEnum(OutboxKind), nullable=False)
+    state: Mapped[OutboxState] = mapped_column(SqlEnum(OutboxState), nullable=False, default=OutboxState.PENDING)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    headers: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    delay_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
