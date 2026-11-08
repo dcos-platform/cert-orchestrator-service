@@ -75,9 +75,41 @@ def client(monkeypatch) -> FakeClient:
     fake = FakeClient()
     monkeypatch.setattr(main, "RabbitMQClient", lambda: fake)
     monkeypatch.setattr(main, "OutboxRelay", FakeRelay)
+    # configure_logging replaces the root handlers, which would drop caplog's handler mid-test.
+    monkeypatch.setattr(main, "configure_logging", lambda: None)
     FakeRelay.last = None
     FakeRelay.ignore_stop = False
     return fake
+
+
+async def asgi_get(app: FastAPI, path: str) -> tuple[int, dict[bytes, bytes], bytes]:
+    """Send one GET to an ASGI app without following redirects; return status, headers and body."""
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "server": ("test", 80),
+        "client": ("test", 1),
+    }
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+    return start["status"], dict(start["headers"]), body
 
 
 @pytest.mark.asyncio
@@ -137,6 +169,7 @@ async def test_consume_failure_stops_the_relay_closes_the_client_and_propagates(
     fake = FakeClient(consume_error=RuntimeError("consume failed"))
     monkeypatch.setattr(main, "RabbitMQClient", lambda: fake)
     monkeypatch.setattr(main, "OutboxRelay", FakeRelay)
+    monkeypatch.setattr(main, "configure_logging", lambda: None)
     FakeRelay.last = None
     app = FastAPI()
 
@@ -151,5 +184,44 @@ async def test_consume_failure_stops_the_relay_closes_the_client_and_propagates(
     assert fake.calls == ["connect", "consume", "close"]
 
 
+@pytest.mark.asyncio
+async def test_lifespan_reapplies_json_logging_before_connecting(client, monkeypatch):
+    order: list[str] = []
+    monkeypatch.setattr(main, "configure_logging", lambda: order.append("configure_logging"))
+    original_connect = client.connect
+
+    async def recording_connect() -> None:
+        order.append("connect")
+        await original_connect()
+
+    client.connect = recording_connect
+
+    async with main.lifespan(FastAPI()):
+        pass
+
+    assert order == ["configure_logging", "connect"]
+
+
 def test_healthz_reports_ok():
     assert main.healthz() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_returns_200_without_redirect():
+    status, headers, body = await asgi_get(main.app, "/metrics")
+
+    assert status == 200
+    assert headers[b"content-type"].decode().startswith("text/plain; version=0.0.4")
+    lines = body.decode().splitlines()
+    for name in (
+        "cert_orchestrator_events_consumed_total",
+        "cert_orchestrator_event_processing_seconds_count",
+        "cert_orchestrator_lifecycle_transitions_total",
+        "cert_orchestrator_dead_letters_total",
+        "cert_orchestrator_outbox_published_total",
+        "cert_orchestrator_outbox_publish_failures_total",
+        "cert_orchestrator_outbox_pending",
+        "cert_orchestrator_outbox_oldest_pending_age_seconds",
+        "cert_orchestrator_relay_pass_failures_total",
+    ):
+        assert any(line.startswith(name) for line in lines), f"{name} missing from the scrape"

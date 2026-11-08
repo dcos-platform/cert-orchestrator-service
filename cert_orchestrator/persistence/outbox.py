@@ -1,9 +1,10 @@
 import json
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from cert_orchestrator.messaging.inbound import HEADER_CORRELATION_ID
@@ -18,6 +19,19 @@ def relay_backoff_seconds(attempt_count: int, base: float, cap: float) -> float:
     """Return the delay after attempt_count failed attempts: base × 2^(attempt_count − 1), capped."""
     exponent = min(attempt_count - 1, _MAX_BACKOFF_EXPONENT)
     return min(cap, base * 2**exponent)
+
+
+@dataclass(frozen=True)
+class OutboxBacklog:
+    """Waiting (PENDING) rows per kind, every kind present, and the age in seconds of the oldest of them."""
+
+    pending_by_kind: dict[OutboxKind, int]
+    oldest_age_seconds: float
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """Treat a naive datetime as UTC, which is what SQLite returns for timestamps stored in UTC."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _json_safe_headers(headers: Mapping[str, Any]) -> dict[str, Any]:
@@ -75,6 +89,23 @@ class OutboxRepository:
             .with_for_update(skip_locked=True)
         )
         return list(self.session.execute(statement).scalars())
+
+    def pending_backlog(self, now: datetime) -> OutboxBacklog:
+        """Count PENDING rows per kind, backed-off rows included, and the age of the oldest, in one statement."""
+        statement = (
+            select(OutboxMessage.kind, func.count(), func.min(OutboxMessage.created_at))
+            .where(OutboxMessage.state == OutboxState.PENDING)
+            .group_by(OutboxMessage.kind)
+        )
+        counts = {kind: 0 for kind in OutboxKind}
+        oldest: datetime | None = None
+        for kind, count, first_created in self.session.execute(statement).all():
+            counts[kind] = count
+            created = _as_utc(first_created)
+            if oldest is None or created < oldest:
+                oldest = created
+        age = 0.0 if oldest is None else max(0.0, (_as_utc(now) - oldest).total_seconds())
+        return OutboxBacklog(pending_by_kind=counts, oldest_age_seconds=age)
 
     def mark_sent(self, row: OutboxMessage, now: datetime) -> None:
         """Record that the broker confirmed the row."""

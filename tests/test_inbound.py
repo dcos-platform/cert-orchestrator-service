@@ -18,6 +18,8 @@ from cert_orchestrator.messaging.inbound import (
     completion_correlation_id,
     effective_exchange,
     effective_routing_key,
+    inbound_correlation_id,
+    known_operation,
     next_transport_action,
     operation_for_routing_key,
     wait_queue_name,
@@ -187,3 +189,43 @@ def test_business_retry_headers_do_not_mutate_the_input():
 
 def test_transport_headers_are_the_attempt_and_death_headers():
     assert TRANSPORT_HEADERS == (HEADER_ATTEMPT, HEADER_X_DEATH)
+
+
+@pytest.mark.parametrize("inbound", ["corr-1", " padded id ", VALID_36])
+def test_inbound_correlation_id_returns_a_valid_header_unchanged(inbound):
+    assert inbound_correlation_id({HEADER_CORRELATION_ID: inbound}) == inbound
+
+
+@pytest.mark.parametrize("inbound", [None, "", "   ", "a" * 37, b"corr", 42])
+def test_inbound_correlation_id_is_none_for_a_header_cert_api_would_reject(inbound):
+    assert inbound_correlation_id({HEADER_CORRELATION_ID: inbound}) is None
+
+
+def test_inbound_correlation_id_is_none_when_the_header_is_absent():
+    assert inbound_correlation_id({}) is None
+
+
+def test_completion_correlation_id_accepts_a_missing_root_and_uses_a_valid_inbound_header():
+    assert completion_correlation_id({HEADER_CORRELATION_ID: "corr-1"}, None) == "corr-1"
+
+
+def test_completion_correlation_id_is_none_for_an_invalid_header_and_a_missing_root():
+    assert completion_correlation_id({HEADER_CORRELATION_ID: "a" * 37}, None) is None
+
+
+@pytest.mark.parametrize(
+    ("routing_key", "operation"),
+    [
+        ("cert.created", LifecycleOperation.CREATE),
+        ("cert.renewed", LifecycleOperation.RENEW),
+        ("cert.revoked", LifecycleOperation.REVOKE),
+        ("cert.expired", LifecycleOperation.EXPIRE),
+    ],
+)
+def test_known_operation_maps_each_cert_api_routing_key(routing_key, operation):
+    assert known_operation(routing_key) is operation
+
+
+@pytest.mark.parametrize("routing_key", ["cert.unknown", "", ["cert.created"], {"k": "v"}, None, 7])
+def test_known_operation_is_none_for_an_unknown_or_non_string_key_and_never_raises(routing_key):
+    assert known_operation(routing_key) is None

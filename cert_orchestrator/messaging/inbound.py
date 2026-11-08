@@ -74,9 +74,16 @@ def effective_exchange(exchange: str, headers: Mapping[str, Any]) -> str:
     return headers.get(HEADER_ORIGINAL_EXCHANGE, exchange)
 
 
+def known_operation(routing_key: Any) -> LifecycleOperation | None:
+    """Return the lifecycle operation for a cert-api routing key, or None for an unknown or non-string key."""
+    if not isinstance(routing_key, str):
+        return None
+    return _OPERATION_BY_ROUTING_KEY.get(routing_key)
+
+
 def operation_for_routing_key(routing_key: str) -> LifecycleOperation:
     """Map a cert-api routing key to its lifecycle operation, or raise UnsupportedOperationError."""
-    operation = _OPERATION_BY_ROUTING_KEY.get(routing_key)
+    operation = known_operation(routing_key)
     if operation is None:
         raise UnsupportedOperationError(f"unsupported routing key: {routing_key!r}")
     return operation
@@ -95,10 +102,16 @@ def _is_valid_correlation_id(value: Any) -> bool:
     return len(value.encode("utf-16-le", errors="surrogatepass")) // 2 <= CORRELATION_ID_MAX_LENGTH
 
 
-def completion_correlation_id(headers: Mapping[str, Any], root_event_id: str) -> str | None:
-    """Return the inbound correlation id if valid, else the root event id if valid, else None."""
+def inbound_correlation_id(headers: Mapping[str, Any]) -> str | None:
+    """Return the x-correlation-id header if cert-api would accept it, else None."""
     inbound = headers.get(HEADER_CORRELATION_ID)
-    if _is_valid_correlation_id(inbound):
+    return inbound if _is_valid_correlation_id(inbound) else None
+
+
+def completion_correlation_id(headers: Mapping[str, Any], root_event_id: str | None) -> str | None:
+    """Return the inbound correlation id if valid, else the root event id if valid, else None."""
+    inbound = inbound_correlation_id(headers)
+    if inbound is not None:
         return inbound
     if _is_valid_correlation_id(root_event_id):
         return root_event_id

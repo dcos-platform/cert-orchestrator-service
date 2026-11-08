@@ -1,14 +1,17 @@
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from cert_orchestrator.config import settings
+from cert_orchestrator.logging_context import CONTEXT_FIELDS, current_context
 from cert_orchestrator.messaging.handlers import LifecycleMessageHandler
 from cert_orchestrator.messaging.inbound import (
     HEADER_ATTEMPT,
@@ -392,3 +395,199 @@ async def test_regression_zero_retries_bug_successful_renew_completes_with_zero_
     completion = [row for row in outbox_rows(engine) if row.message_id == "evt-renew-ok"]
     assert [json.loads(row.body)["status"] for row in completion] == ["COMPLETED"]
     assert [json.loads(row.body)["retry_count"] for row in completion] == [0]
+
+
+CONSUMED_TOTAL = "cert_orchestrator_events_consumed_total"
+TRANSITIONS_TOTAL = "cert_orchestrator_lifecycle_transitions_total"
+PROCESSING_COUNT = "cert_orchestrator_event_processing_seconds_count"
+
+
+def processing_lines(json_log: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [line for line in json_log() if line["message"] == "Processed lifecycle event"]
+
+
+@pytest.mark.asyncio
+async def test_processed_line_carries_the_context_and_the_completion_correlation_id(engine, session, json_log):
+    await LifecycleMessageHandler().handle(
+        make_message("evt-ctx", "cert-ctx", headers={HEADER_CORRELATION_ID: "corr-ctx"})
+    )
+
+    (row,) = outbox_rows(engine)
+    (line,) = processing_lines(json_log)
+    assert line["correlationId"] == row.headers[HEADER_CORRELATION_ID] == "corr-ctx"
+    assert (line["certificateId"], line["eventId"], line["operation"], line["state"]) == (
+        "cert-ctx",
+        "evt-ctx",
+        "CREATE",
+        "COMPLETED",
+    )
+    assert current_context() == dict.fromkeys(CONTEXT_FIELDS), "the context is restored once handling returns"
+
+
+@pytest.mark.asyncio
+async def test_a_retried_attempt_without_an_inbound_id_logs_the_root_event_id(engine, session, json_log, three_retries):
+    handler = LifecycleMessageHandler()
+    await handler.handle(make_message("evt-root-log", "cert-root-log", should_fail=True))
+    (retry,) = outbox_rows(engine)
+
+    await handler.handle(inbound_from_row(retry))
+
+    lines = processing_lines(json_log)
+    assert [line["correlationId"] for line in lines] == ["evt-root-log", "evt-root-log"]
+    assert [line["state"] for line in lines] == ["PROCESSING", "PROCESSING"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_skip_line_carries_the_context_and_no_state(engine, session, json_log):
+    handler = LifecycleMessageHandler()
+    message = make_message("evt-dup-log", "cert-dup-log", headers={HEADER_CORRELATION_ID: "corr-dup"})
+    await handler.handle(message)
+
+    await handler.handle(message)
+
+    (skip,) = [line for line in json_log() if line["message"] == "Skipping duplicate event"]
+    assert (skip["correlationId"], skip["certificateId"], skip["eventId"], skip["operation"]) == (
+        "corr-dup",
+        "cert-dup-log",
+        "evt-dup-log",
+        "CREATE",
+    )
+    assert "state" not in skip
+
+
+@pytest.mark.asyncio
+async def test_a_chain_with_no_valid_correlation_id_logs_none(engine, session, json_log):
+    message = make_message(
+        "evt-none",
+        "cert-none",
+        headers={HEADER_CORRELATION_ID: "c" * 37, HEADER_ROOT_EVENT_ID: "r" * 37},
+    )
+
+    await LifecycleMessageHandler().handle(message)
+
+    (line,) = processing_lines(json_log)
+    assert "correlationId" not in line
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_body_raises_before_any_context_is_set(engine, session, json_log):
+    bad = InboundMessage(
+        body={"certificate_id": "cert-bad"},
+        routing_key="cert.created",
+        headers={HEADER_CORRELATION_ID: "corr-bad"},
+        exchange="cert.events",
+    )
+
+    with pytest.raises(ValidationError):
+        await LifecycleMessageHandler().handle(bad)
+
+    assert json_log() == []
+    assert current_context() == dict.fromkeys(CONTEXT_FIELDS)
+
+
+@pytest.mark.asyncio
+async def test_a_processed_create_moves_the_processed_transition_and_timing_counters_by_one(
+    engine, session, metric_value
+):
+    before = (
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+        metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="COMPLETED"),
+        metric_value(PROCESSING_COUNT, operation="CREATE"),
+    )
+
+    await LifecycleMessageHandler().handle(make_message("evt-m-ok", "cert-m-ok"))
+
+    after = (
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+        metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="COMPLETED"),
+        metric_value(PROCESSING_COUNT, operation="CREATE"),
+    )
+    assert [a - b for a, b in zip(after, before, strict=True)] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_moves_only_the_duplicate_and_timing_counters(engine, session, metric_value):
+    handler = LifecycleMessageHandler()
+    message = make_message("evt-m-dup", "cert-m-dup")
+    await handler.handle(message)
+    before = (
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="duplicate"),
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+        metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="COMPLETED"),
+        metric_value(PROCESSING_COUNT, operation="CREATE"),
+    )
+
+    await handler.handle(message)
+
+    after = (
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="duplicate"),
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+        metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="COMPLETED"),
+        metric_value(PROCESSING_COUNT, operation="CREATE"),
+    )
+    assert [a - b for a, b in zip(after, before, strict=True)] == [1, 0, 0, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_chain_ending_failed_moves_processing_and_failed_by_the_expected_amounts(
+    engine, session, metric_value, three_retries
+):
+    def snapshot() -> tuple[float, ...]:
+        return (
+            metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="PROCESSING"),
+            metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="FAILED"),
+            metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+            metric_value(PROCESSING_COUNT, operation="CREATE"),
+        )
+
+    before = snapshot()
+
+    await drive_retry_chain(
+        engine, LifecycleMessageHandler(), make_message("evt-m-chain", "cert-m-chain", should_fail=True)
+    )
+
+    assert [a - b for a, b in zip(snapshot(), before, strict=True)] == [2, 1, 3, 3]
+
+
+@pytest.mark.asyncio
+async def test_a_revoke_moves_its_transition_and_writes_no_outbox_row(engine, session, metric_value):
+    before = metric_value(TRANSITIONS_TOTAL, operation="REVOKE", state="COMPLETED")
+
+    await LifecycleMessageHandler().handle(make_message("evt-m-rev", "cert-m-rev", routing_key="cert.revoked"))
+
+    assert metric_value(TRANSITIONS_TOTAL, operation="REVOKE", state="COMPLETED") - before == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_handling_moves_timing_but_no_processed_or_transition_counter(
+    engine, session, monkeypatch, metric_value
+):
+    def failing_commit() -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(session, "commit", failing_commit)
+    before = (
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+        metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="COMPLETED"),
+        metric_value(PROCESSING_COUNT, operation="CREATE"),
+    )
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await LifecycleMessageHandler().handle(make_message("evt-m-rb", "cert-m-rb"))
+
+    after = (
+        metric_value(CONSUMED_TOTAL, operation="CREATE", outcome="processed"),
+        metric_value(TRANSITIONS_TOTAL, operation="CREATE", state="COMPLETED"),
+        metric_value(PROCESSING_COUNT, operation="CREATE"),
+    )
+    assert [a - b for a, b in zip(after, before, strict=True)] == [0, 0, 1]
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_routing_key_moves_no_processing_timer(engine, session, metric_value):
+    before = metric_value(PROCESSING_COUNT, operation="CREATE")
+
+    with pytest.raises(UnsupportedOperationError):
+        await LifecycleMessageHandler().handle(make_message("evt-m-unk", "cert-m-unk", routing_key="cert.unknown"))
+
+    assert metric_value(PROCESSING_COUNT, operation="CREATE") == before

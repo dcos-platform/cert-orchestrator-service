@@ -1,15 +1,19 @@
 import asyncio
 import contextlib
 import json
+import logging
 import time
+import traceback
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aio_pika
 import pytest
 from sqlalchemy import delete, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from cert_orchestrator.config import Settings
@@ -360,3 +364,49 @@ async def test_revoke_gets_no_completion_and_create_does(client_with_cleanup, re
         with contextlib.suppress(asyncio.CancelledError):
             await consume_task
         await exchange.delete()
+
+
+@pytest.mark.integration
+def test_pending_backlog_on_postgres_moves_by_the_rows_added_and_reads_aware_timestamps(run_ids):
+    """Postgres returns aware created_at: the backlog counts move by exactly the rows this test adds."""
+    with SessionLocal() as session:
+        before = OutboxRepository(session).pending_backlog(datetime.now(UTC))
+
+    with SessionLocal() as session:
+        repository = OutboxRepository(session)
+        completion = CompletionEvent(
+            event_id=f"{run_ids.event_id}-pc",
+            certificate_id=run_ids.certificate_id,
+            status="COMPLETED",
+            retry_count=0,
+        )
+        repository.enqueue_completion(completion, None)
+        repository.enqueue_retry({"event_id": f"{run_ids.event_id}-pr:retry:1"}, 5, {})
+        session.commit()
+
+    with SessionLocal() as session:
+        after = OutboxRepository(session).pending_backlog(datetime.now(UTC) + timedelta(seconds=1000))
+
+    assert after.pending_by_kind[OutboxKind.COMPLETION] - before.pending_by_kind[OutboxKind.COMPLETION] == 1
+    assert after.pending_by_kind[OutboxKind.RETRY] - before.pending_by_kind[OutboxKind.RETRY] == 1
+    assert after.oldest_age_seconds >= 1000
+
+
+@pytest.mark.integration
+def test_database_error_text_does_not_quote_the_message_body(run_ids, json_log):
+    """A failed write names its statement but not its values, so no logged traceback carries the message body."""
+    sentinel = f"BODY-SENTINEL-{run_ids.uid}"
+    message_id = f"{run_ids.event_id}-dbe:retry:1"
+    with SessionLocal() as session:
+        OutboxRepository(session).enqueue_retry({"event_id": message_id}, 5, {})
+        session.commit()
+
+    with pytest.raises(IntegrityError) as caught, SessionLocal() as session:
+        OutboxRepository(session).enqueue_retry({"event_id": message_id, "note": sentinel}, 5, {})
+        session.commit()
+
+    error = caught.value
+    assert sentinel not in str(error)
+    assert sentinel not in "".join(traceback.format_exception(error))
+    logging.getLogger(__name__).error("Database write failed", exc_info=error)
+    assert sentinel not in json.dumps(json_log())

@@ -7,6 +7,7 @@ from aio_pika.abc import AbstractIncomingMessage
 from pydantic import ValidationError
 
 from cert_orchestrator.config import Settings
+from cert_orchestrator.logging_context import log_context
 from cert_orchestrator.messaging.inbound import (
     HEADER_ATTEMPT,
     HEADER_DEAD_LETTER_REASON,
@@ -19,12 +20,30 @@ from cert_orchestrator.messaging.inbound import (
     UnsupportedOperationError,
     effective_exchange,
     effective_routing_key,
+    inbound_correlation_id,
+    known_operation,
     next_transport_action,
     wait_queue_name,
 )
+from cert_orchestrator.metrics import ConsumeOutcome, record_dead_letter, record_event_consumed
 from cert_orchestrator.models import OutboxKind, OutboxMessage
 
 logger = logging.getLogger(__name__)
+
+# The body's key for the event id; read for log context only, never for routing.
+EVENT_ID_KEY = "event_id"
+
+
+def _body_event_id(body: bytes) -> str | None:
+    """Return the body's event_id when the body is a JSON object holding a non-blank string one, else None."""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    event_id = payload.get(EVENT_ID_KEY) if isinstance(payload, dict) else None
+    if isinstance(event_id, str) and event_id.strip():
+        return event_id
+    return None
 
 
 class RabbitMQClient:
@@ -65,7 +84,15 @@ class RabbitMQClient:
         await queue.consume(self._on_message)
 
     async def _on_message(self, message: AbstractIncomingMessage) -> None:
-        """Process an incoming message with validation and error handling."""
+        """Process one delivery with its log context set for the whole handling."""
+        with log_context(
+            correlationId=inbound_correlation_id(message.headers),
+            eventId=_body_event_id(message.body),
+        ):
+            await self._settle_delivery(message)
+
+    async def _settle_delivery(self, message: AbstractIncomingMessage) -> None:
+        """Decode, hand to the handler, then ack, dead-letter, transport-retry or nack the delivery."""
         try:
             payload = json.loads(message.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -123,11 +150,8 @@ class RabbitMQClient:
         try:
             await self._dead_letter(message, reason, original_body=original_body, exception=exception)
             return True
-        except Exception as e:
-            logger.error(
-                "Failed to dead-letter message",
-                extra={"reason": reason.value, "error": str(e)},
-            )
+        except Exception:
+            logger.exception("Failed to dead-letter message", extra={"reason": reason.value})
             await message.nack(requeue=True)
             return False
 
@@ -139,11 +163,11 @@ class RabbitMQClient:
         action = next_transport_action(attempt, self.config.max_delivery_attempts)
         try:
             if action == TransportAction.RETRY:
-                await self._schedule_transport_retry(message, inbound, attempt)
+                await self._schedule_transport_retry(message, inbound, attempt, exception)
             else:
                 await self._dead_letter(message, DeadLetterReason.EXHAUSTED, exception=exception)
-        except Exception as e:
-            logger.error("Failed to handle transport error", extra={"action": action.value, "error": str(e)})
+        except Exception:
+            logger.exception("Failed to handle transport error (%s)", action.value)
             await message.nack(requeue=True)
             return False
         return True
@@ -184,6 +208,13 @@ class RabbitMQClient:
 
         dlx = await self.channel.get_exchange(self.config.dead_letter_exchange)
         await dlx.publish(message_obj, routing_key=routing_key)
+        record_dead_letter(reason)
+        record_event_consumed(known_operation(routing_key), ConsumeOutcome.DEAD_LETTERED)
+        # Only EXHAUSTED carries a traceback, whatever exception a caller passes (C-19).
+        if reason == DeadLetterReason.EXHAUSTED:
+            logger.error("Message dead-lettered", exc_info=exception, extra={"reason": reason.value})
+        else:
+            logger.warning("Message dead-lettered", extra={"reason": reason.value})
 
     async def _ensure_wait_queue(self, delay_seconds: int) -> str:
         """Ensure wait queue exists and return its name."""
@@ -202,7 +233,7 @@ class RabbitMQClient:
         return queue_name
 
     async def _schedule_transport_retry(
-        self, message: AbstractIncomingMessage, inbound: InboundMessage, attempt: int
+        self, message: AbstractIncomingMessage, inbound: InboundMessage, attempt: int, exception: Exception
     ) -> None:
         """Schedule transport retry via wait queue with exponential backoff."""
         if not self.channel:
@@ -228,6 +259,14 @@ class RabbitMQClient:
         )
 
         await self.channel.default_exchange.publish(message_obj, routing_key=queue_name)
+        record_event_consumed(known_operation(inbound.routing_key), ConsumeOutcome.TRANSPORT_RETRY)
+        logger.warning(
+            "Transport retry scheduled (attempt %d of %d, delay %d s)",
+            attempt,
+            self.config.max_delivery_attempts,
+            delay_seconds,
+            exc_info=exception,
+        )
 
     async def publish_outbox_message(self, row: OutboxMessage) -> None:
         """Publish a stored outbox row as written: completions to the completion queue, retries via their wait queue."""
